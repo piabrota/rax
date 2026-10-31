@@ -7,8 +7,7 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use rax_api::v1alpha1::{Condition, Task, TaskSpec, TaskStatus, Workspace};
 use rax_api::{
-    DEFAULT_SYSTEM_NAMESPACE, DEFAULT_TASK_IMAGE, condition, phase, reason, to_yaml,
-    validate_resources,
+    DEFAULT_SYSTEM_NAMESPACE, DEFAULT_TASK_IMAGE, condition, reason, to_yaml, validate_resources,
 };
 use rax_substrate::ateapi;
 use rax_substrate::probe::HttpProbe;
@@ -18,7 +17,7 @@ use tonic::{Code, Status};
 use tracing::{info, warn};
 
 use crate::tasks::now;
-use crate::{Actor, ActorState, Actors, ReconcileError, Reconciler};
+use crate::{Actor, ActorState, Actors, Reconciler};
 
 /// How many bytes of the spec digest go into a per-task template name.
 const TEMPLATE_DIGEST_BYTES: usize = 4;
@@ -60,7 +59,8 @@ impl Default for ControllerOptions {
     }
 }
 
-/// Reconciles tasks by provisioning and driving their actors on Substrate.
+/// Runs tasks as actors on Substrate: provisions, suspends, resumes and
+/// deletes them.
 pub struct TaskReconciler {
     client: Client,
     opts: ControllerOptions,
@@ -157,15 +157,25 @@ fn router_url(addr: &str) -> String {
     format!("{}/readyz?check=workspace", base.trim_end_matches('/'))
 }
 
-/// A failure with the task as far as it got: Ready False with `reason`,
-/// and the phase Pending when Substrate may come back, Failed otherwise.
+/// The task's atespace and name, which is also its actor's name.
+fn atespace_and_name(task: &Task) -> (String, String) {
+    let meta = task.metadata.as_ref();
+    (
+        meta.map(|m| m.atespace.clone()).unwrap_or_default(),
+        meta.map(|m| m.name.clone()).unwrap_or_default(),
+    )
+}
+
+/// Records a failure on the task as a False Ready condition: reason
+/// SubstrateUnavailable when Substrate may come back, `failed_reason`
+/// otherwise. The phase is the caller's to set.
 fn fail(
-    mut task: Task,
+    task: &mut Task,
     err: &SubstrateError,
     outer: &str,
     failed_reason: &str,
     message: String,
-) -> ReconcileError {
+) -> Status {
     let st = task.status.get_or_insert_with(Default::default);
     if err.is_transient() {
         set_condition(
@@ -175,15 +185,10 @@ fn fail(
             reason::SUBSTRATE_UNAVAILABLE,
             err.to_string(),
         );
-        st.phase = phase::PENDING.into();
     } else {
         set_condition(st, condition::READY, "False", failed_reason, message);
-        st.phase = phase::FAILED.into();
     }
-    ReconcileError {
-        task: Some(task),
-        status: err.clone().context(outer).to_status(),
-    }
+    err.clone().context(outer).to_status()
 }
 
 impl TaskReconciler {
@@ -255,13 +260,16 @@ impl TaskReconciler {
     }
 }
 
-#[async_trait]
-impl Reconciler for TaskReconciler {
-    async fn reconcile(
+impl TaskReconciler {
+    /// Fills in the task's defaults and makes sure its atespace,
+    /// ActorTemplate and actor exist on Substrate. It records only what AX
+    /// stores in the task's status: the task ID, and on failure the reason in
+    /// a False Ready condition.
+    async fn ensure_substrate_resources(
         &self,
-        mut task: Task,
+        task: &mut Task,
         workspace: Option<Workspace>,
-    ) -> Result<Task, ReconcileError> {
+    ) -> Result<(), Status> {
         let meta = task.metadata.get_or_insert_with(Default::default);
         if meta.atespace.is_empty() {
             meta.atespace = "default".into();
@@ -273,7 +281,10 @@ impl Reconciler for TaskReconciler {
         }
         let image = spec.image.clone();
         task.status.get_or_insert_with(Default::default);
-        info!(name, atespace, image, "reconciling task");
+        info!(
+            name,
+            atespace, image, "ensuring Substrate resources for task"
+        );
 
         // 1. The atespace.
         if let Err(e) = self.client.ensure_atespace(&atespace).await {
@@ -289,12 +300,10 @@ impl Reconciler for TaskReconciler {
 
         // 2. The actor is always named after the task, so the two can be
         // used interchangeably (for example in the router's
-        // ate-target-actor header). Whatever a client put in status.actor
-        // is overwritten.
+        // ate-target-actor header).
         let actor = name.clone();
         {
             let st = task.status.as_mut().unwrap();
-            st.actor = actor.clone();
             if st.id.is_empty() {
                 let secs = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
@@ -338,11 +347,9 @@ impl Reconciler for TaskReconciler {
                 reason::INVALID_RESOURCES,
                 e.to_string(),
             );
-            st.phase = phase::FAILED.into();
-            return Err(ReconcileError {
-                task: Some(task),
-                status: Status::invalid_argument(format!("validating resources: {e}")),
-            });
+            return Err(Status::invalid_argument(format!(
+                "validating resources: {e}"
+            )));
         }
         let resources = resource_limits(spec.resources.as_ref());
 
@@ -397,24 +404,27 @@ impl Reconciler for TaskReconciler {
             ));
         }
 
-        // 4. Suspend or resume. New tasks start suspended.
-        let st = task.status.as_mut().unwrap();
-        if st.phase.is_empty() || st.phase == phase::SUSPENDED {
-            info!(actor, "suspending actor on Substrate");
-            if let Err(e) = self.client.suspend_actor(&atespace, &actor).await {
-                let status = e.context("suspending actor").to_status();
-                return Err(ReconcileError {
-                    task: Some(task),
-                    status,
-                });
-            }
-            let st = task.status.as_mut().unwrap();
-            st.worker_ip.clear();
-            st.phase = phase::SUSPENDED.into();
-            info!(name, actor, "task suspended");
-            return Ok(task);
-        }
+        Ok(())
+    }
+}
 
+#[async_trait]
+impl Reconciler for TaskReconciler {
+    async fn suspend(&self, task: &mut Task, workspace: Option<Workspace>) -> Result<(), Status> {
+        self.ensure_substrate_resources(task, workspace).await?;
+        let (atespace, actor) = atespace_and_name(task);
+        info!(actor, "suspending actor on Substrate");
+        self.client
+            .suspend_actor(&atespace, &actor)
+            .await
+            .map_err(|e| e.context("suspending actor").to_status())?;
+        info!(actor, "task suspended");
+        Ok(())
+    }
+
+    async fn resume(&self, task: &mut Task, workspace: Option<Workspace>) -> Result<(), Status> {
+        self.ensure_substrate_resources(task, workspace).await?;
+        let (atespace, actor) = atespace_and_name(task);
         info!(actor, "resuming actor on Substrate worker");
         let worker = match self.client.resume_actor(&atespace, &actor).await {
             Ok((_, ip)) => ip,
@@ -429,9 +439,7 @@ impl Reconciler for TaskReconciler {
                 ));
             }
         };
-        let st = task.status.as_mut().unwrap();
-        st.worker_ip = worker.clone();
-        st.phase = phase::RUNNING.into();
+        let st = task.status.get_or_insert_with(Default::default);
 
         // Workspace setup happens once per task: once WorkspaceReady is True
         // it stays so across suspends and resumes, so only poll before that.
@@ -458,11 +466,11 @@ impl Reconciler for TaskReconciler {
                 format!("Workspace is initializing at {worker}"),
             );
         }
-        info!(name, actor, worker, ready, "task running");
-        Ok(task)
+        info!(actor, worker, ready, "task resumed");
+        Ok(())
     }
 
-    async fn reconcile_delete(&self, atespace: &str, name: &str) -> Result<(), Status> {
+    async fn delete(&self, atespace: &str, name: &str) -> Result<(), Status> {
         let atespace = if atespace.is_empty() {
             "default"
         } else {

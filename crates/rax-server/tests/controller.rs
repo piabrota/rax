@@ -79,16 +79,19 @@ async fn provisions_and_resumes_a_running_task() {
     let (fake, r) = setup("").await;
     let mut t = task("test-task", "ghrc.io/my-org/my-image", Some(phase::RUNNING));
     t.spec.as_mut().unwrap().command = vec!["/bin/task-runner".into()];
-    // A client-supplied actor name must not survive.
-    t.status.as_mut().unwrap().actor = "not-the-task".into();
 
-    let got = r.reconcile(t, None).await.unwrap();
+    r.resume(&mut t, None).await.unwrap();
+    let got = t;
     let st = status(&got);
-    assert_eq!(st.phase, phase::RUNNING);
-    assert_eq!(st.actor, "test-task");
-    assert_eq!(st.worker_ip, "10.244.1.42");
+    // The phase, actor and worker are the server's to read from the actor.
+    assert_eq!(st.phase, phase::RUNNING, "left as the caller set it");
     assert!(st.id.starts_with("task-test-task-"), "{}", st.id);
     assert_condition(&got, "WorkspaceReady", "False", reason::INITIALIZING);
+    assert!(
+        condition(&got, "WorkspaceReady")
+            .message
+            .ends_with("10.244.1.42")
+    );
 
     let s = fake.state();
     assert_eq!(s.calls_of("CreateAtespace"), ["default"]);
@@ -120,10 +123,8 @@ async fn defaults_the_task_image() {
         ),
     ] {
         let (fake, r) = setup(over).await;
-        let got = r
-            .reconcile(task("no-image", "", Some(phase::RUNNING)), None)
-            .await
-            .unwrap();
+        let mut got = task("no-image", "", None);
+        r.resume(&mut got, None).await.unwrap();
         assert_eq!(got.spec.unwrap().image, want);
         let images: Vec<_> = fake
             .state()
@@ -138,12 +139,9 @@ async fn defaults_the_task_image() {
 #[tokio::test]
 async fn new_tasks_are_suspended() {
     let (fake, r) = setup("").await;
-    let got = r
-        .reconcile(task("suspend-task", "img", None), None)
-        .await
-        .unwrap();
-    assert_eq!(status(&got).phase, phase::SUSPENDED);
-    assert_eq!(status(&got).worker_ip, "");
+    let mut got = task("suspend-task", "img", None);
+    r.suspend(&mut got, None).await.unwrap();
+    assert_eq!(status(&got).phase, "", "the phase is the caller's to set");
     assert_eq!(
         fake.state().calls_of("SuspendActor"),
         ["default/suspend-task"]
@@ -166,9 +164,10 @@ async fn a_failed_suspend_keeps_the_status() {
         reason: reason::TASK_RUNNING.into(),
         ..Default::default()
     });
-    let err = r.reconcile(t, None).await.unwrap_err();
-    assert_eq!(err.status.code(), Code::Unavailable);
-    let got = err.task.unwrap();
+    let err = r.suspend(&mut t, None).await.unwrap_err();
+    assert_eq!(err.code(), Code::Unavailable);
+    let got = t;
+    assert_eq!(status(&got).phase, phase::SUSPENDED);
     assert_eq!(status(&got).worker_ip, "10.1.1.1");
     assert_condition(&got, "Ready", "True", reason::TASK_RUNNING);
 }
@@ -185,14 +184,13 @@ async fn a_rejected_template_fails_the_task_with_substrates_message() {
         Some(phase::RUNNING),
     );
     t.spec.as_mut().unwrap().command = vec!["python3".into(), "/app/agent.py".into()];
-    let err = r.reconcile(t, None).await.unwrap_err();
+    let err = r.resume(&mut t, None).await.unwrap_err();
     assert!(
-        err.status.message().contains("must be pinned by digest"),
+        err.message().contains("must be pinned by digest"),
         "{}",
-        err.status.message()
+        err.message()
     );
-    let got = err.task.unwrap();
-    assert_eq!(status(&got).phase, phase::FAILED);
+    let got = t;
     assert_condition(&got, "Ready", "False", reason::TEMPLATE_CREATION_FAILED);
     assert_eq!(
         condition(&got, "Ready").message,
@@ -213,15 +211,9 @@ async fn a_transient_template_failure_leaves_the_task_pending() {
             "substrate control plane timed out",
         )],
     );
-    let err = r
-        .reconcile(
-            task("template-transient", "img@sha256:00", Some(phase::RUNNING)),
-            None,
-        )
-        .await
-        .unwrap_err();
-    let got = err.task.unwrap();
-    assert_eq!(status(&got).phase, phase::PENDING);
+    let mut got = task("template-transient", "img@sha256:00", None);
+    let err = r.resume(&mut got, None).await.unwrap_err();
+    assert_eq!(err.code(), Code::DeadlineExceeded);
     assert_condition(&got, "Ready", "False", reason::SUBSTRATE_UNAVAILABLE);
     assert!(fake.state().calls_of("CreateActor").is_empty());
 }
@@ -247,16 +239,18 @@ async fn ready_server() -> String {
 async fn workspace_readiness_is_polled_until_it_is_set_up() {
     let (fake, r) = setup("").await;
     let ready = ready_server().await;
-    let t = task("ready-task", "", Some(phase::RUNNING));
+    let t = task("ready-task", "", None);
     fake.state().worker_ip = "127.0.0.1:1".into();
 
     // The worker does not answer: still initializing.
-    let got = r.reconcile(t.clone(), None).await.unwrap();
+    let mut got = t.clone();
+    r.resume(&mut got, None).await.unwrap();
     assert_condition(&got, "WorkspaceReady", "False", reason::INITIALIZING);
 
     // It answers: set up.
     fake.state().worker_ip = ready.clone();
-    let got = r.reconcile(t, None).await.unwrap();
+    let mut got = t;
+    r.resume(&mut got, None).await.unwrap();
     assert_condition(&got, "WorkspaceReady", "True", reason::SETUP_COMPLETE);
     assert_eq!(
         condition(&got, "WorkspaceReady").message,
@@ -264,17 +258,12 @@ async fn workspace_readiness_is_polled_until_it_is_set_up() {
     );
 
     // Suspending keeps WorkspaceReady.
-    let mut t = got;
-    t.status.as_mut().unwrap().phase = phase::SUSPENDED.into();
-    let got = r.reconcile(t, None).await.unwrap();
-    assert_eq!(status(&got).phase, phase::SUSPENDED);
+    r.suspend(&mut got, None).await.unwrap();
     assert_condition(&got, "WorkspaceReady", "True", reason::SETUP_COMPLETE);
 
     // Resuming onto an unreachable worker trusts the recorded readiness.
     fake.state().worker_ip = "127.0.0.1:1".into();
-    let mut t = got;
-    t.status.as_mut().unwrap().phase = phase::RUNNING.into();
-    let got = r.reconcile(t, None).await.unwrap();
+    r.resume(&mut got, None).await.unwrap();
     assert_condition(&got, "WorkspaceReady", "True", reason::SETUP_COMPLETE);
     assert_eq!(
         fake.state().templates.len(),
@@ -283,9 +272,8 @@ async fn workspace_readiness_is_polled_until_it_is_set_up() {
     );
 
     // A launch configuration change gets its own template.
-    let mut t = got;
-    t.spec.as_mut().unwrap().command = vec!["python3".into(), "agent.py".into()];
-    r.reconcile(t, None).await.unwrap();
+    got.spec.as_mut().unwrap().command = vec!["python3".into(), "agent.py".into()];
+    r.resume(&mut got, None).await.unwrap();
     assert_eq!(fake.state().templates.len(), 2);
 }
 
@@ -303,10 +291,8 @@ async fn readiness_is_also_probed_through_the_router() {
         },
     );
     fake.state().worker_ip = "127.0.0.1:1".into();
-    let got = r
-        .reconcile(task("routed", "img", Some(phase::RUNNING)), None)
-        .await
-        .unwrap();
+    let mut got = task("routed", "img", None);
+    r.resume(&mut got, None).await.unwrap();
     assert_condition(&got, "WorkspaceReady", "True", reason::SETUP_COMPLETE);
 }
 
@@ -334,15 +320,15 @@ fn with_limits(mut t: Task, cpu: &str, memory: &str) -> Task {
 async fn resource_limits_go_on_the_template() {
     let (fake, r) = setup("").await;
     let t = with_limits(task("sized-task", "img", None), "2", "4Gi");
-    r.reconcile(t.clone(), None).await.unwrap();
+    r.suspend(&mut t.clone(), None).await.unwrap();
     assert_eq!(
         fake.state().created_templates[0].resources,
         limits(2000, 4 << 30)
     );
 
     // A new limit is a new launch configuration, so a new template.
-    let t = with_limits(t, "2", "8Gi");
-    r.reconcile(t, None).await.unwrap();
+    let mut t = with_limits(t, "2", "8Gi");
+    r.suspend(&mut t, None).await.unwrap();
     {
         let s = fake.state();
         assert_eq!(s.created_templates.len(), 2);
@@ -351,7 +337,7 @@ async fn resource_limits_go_on_the_template() {
         assert_eq!(s.created_templates[1].resources, limits(2000, 8 << 30));
     }
 
-    r.reconcile(task("plain-task", "img", None), None)
+    r.suspend(&mut task("plain-task", "img", None), None)
         .await
         .unwrap();
     assert_eq!(
@@ -406,10 +392,9 @@ async fn invalid_limits_fail_before_provisioning() {
     for reqs in bad {
         let mut t = task("bad-limits", "img", None);
         t.spec.as_mut().unwrap().resources = Some(reqs.clone());
-        let err = r.reconcile(t, None).await.unwrap_err();
-        let got = err.task.unwrap();
-        assert_eq!(status(&got).phase, phase::FAILED, "{reqs:?}");
-        assert_condition(&got, "Ready", "False", reason::INVALID_RESOURCES);
+        let err = r.resume(&mut t, None).await.unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument, "{reqs:?}");
+        assert_condition(&t, "Ready", "False", reason::INVALID_RESOURCES);
     }
     let s = fake.state();
     assert!(s.created_templates.is_empty() && s.calls_of("CreateActor").is_empty());
@@ -427,9 +412,8 @@ async fn rejected_templates_never_fall_back() {
         if with {
             t = with_limits(t, "2", "4Gi");
         }
-        let got = r.reconcile(t, None).await.unwrap_err().task.unwrap();
-        assert_eq!(status(&got).phase, phase::FAILED);
-        assert_condition(&got, "Ready", "False", reason::TEMPLATE_CREATION_FAILED);
+        r.suspend(&mut t, None).await.unwrap_err();
+        assert_condition(&t, "Ready", "False", reason::TEMPLATE_CREATION_FAILED);
         assert!(fake.state().calls_of("CreateActor").is_empty());
     }
 }
@@ -462,7 +446,7 @@ async fn delete_removes_the_actor_and_its_templates_only() {
                 .insert(format!("default/{name}"), template(name));
         }
     }
-    r.reconcile_delete("default", "job").await.unwrap();
+    r.delete("default", "job").await.unwrap();
     let s = fake.state();
     assert_eq!(s.calls_of("DeleteActor"), ["default/job"]);
     assert_eq!(
@@ -486,7 +470,7 @@ async fn delete_waits_for_the_actor_to_go() {
     fake.state()
         .put_actor("default", "slow", ateapi::ActorState::Running);
     fake.state().deleting_polls = 2;
-    r.reconcile_delete("", "slow").await.unwrap();
+    r.delete("", "slow").await.unwrap();
     assert!(fake.state().calls_of("GetActor").len() >= 3);
     assert!(fake.state().actors.is_empty());
 }
@@ -502,7 +486,7 @@ async fn delete_gives_up_on_an_actor_that_stays() {
     fake.state()
         .put_actor("default", "stuck", ateapi::ActorState::Running);
     fake.state().deleting_polls = usize::MAX;
-    let err = r.reconcile_delete("default", "stuck").await.unwrap_err();
+    let err = r.delete("default", "stuck").await.unwrap_err();
     assert_eq!(err.code(), Code::DeadlineExceeded);
     assert!(
         err.message().contains("context deadline exceeded"),
@@ -515,52 +499,43 @@ async fn delete_gives_up_on_an_actor_that_stays() {
 async fn transient_failures_leave_tasks_pending_and_recover() {
     let (fake, r) = setup("").await;
 
-    let pending = |e: rax_server::ReconcileError| {
-        let got = e.task.unwrap();
-        assert_eq!(status(&got).phase, phase::PENDING);
-        assert_condition(&got, "Ready", "False", reason::SUBSTRATE_UNAVAILABLE);
-        got
-    };
+    #[track_caller]
+    fn pending(t: &Task, e: Status) {
+        assert!(rax_server::is_transient(&e), "{e:?}");
+        assert_condition(t, "Ready", "False", reason::SUBSTRATE_UNAVAILABLE);
+    }
 
     fake.state()
         .fail("CreateAtespace", [Status::deadline_exceeded("timed out")]);
-    pending(
-        r.reconcile(task("transient-atespace", "img", None), None)
-            .await
-            .unwrap_err(),
-    );
+    let mut t = task("transient-atespace", "img", None);
+    let e = r.suspend(&mut t, None).await.unwrap_err();
+    pending(&t, e);
 
     fake.state()
         .fail("CreateActor", [Status::deadline_exceeded("timed out")]);
-    pending(
-        r.reconcile(task("transient-actor", "img", None), None)
-            .await
-            .unwrap_err(),
-    );
+    let mut t = task("transient-actor", "img", None);
+    let e = r.suspend(&mut t, None).await.unwrap_err();
+    pending(&t, e);
 
     fake.state()
         .fail("ResumeActor", [Status::deadline_exceeded("unreachable")]);
-    let mut t = pending(
-        r.reconcile(task("transient-resume", "img", Some(phase::RUNNING)), None)
-            .await
-            .unwrap_err(),
+    let mut t = task("transient-resume", "img", None);
+    let e = r.resume(&mut t, None).await.unwrap_err();
+    pending(&t, e);
+    r.resume(&mut t, None).await.unwrap();
+    assert_eq!(
+        fake.state().actor_state("default", "transient-resume"),
+        Some(ateapi::ActorState::Running)
     );
-    t.status.as_mut().unwrap().phase = phase::RUNNING.into();
-    let got = r.reconcile(t, None).await.unwrap();
-    assert_eq!(status(&got).phase, phase::RUNNING);
 
     fake.state().fail(
         "CreateActor",
         [Status::invalid_argument("invalid actor specification")],
     );
-    let got = r
-        .reconcile(task("permanent", "img", None), None)
-        .await
-        .unwrap_err()
-        .task
-        .unwrap();
-    assert_eq!(status(&got).phase, phase::FAILED);
-    assert_condition(&got, "Ready", "False", reason::ACTOR_CREATION_FAILED);
+    let mut t = task("permanent", "img", None);
+    let e = r.suspend(&mut t, None).await.unwrap_err();
+    assert!(!rax_server::is_transient(&e));
+    assert_condition(&t, "Ready", "False", reason::ACTOR_CREATION_FAILED);
 }
 
 #[tokio::test]

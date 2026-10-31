@@ -1,0 +1,22 @@
+[package]
+name = "rax-claude-code-runner"
+description = "A RAX task runner that runs Claude Code headlessly, configured from the Task's spec.config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rax-claude-code-runner"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+pbjson-types.workspace = true
+rax-api.workspace = true
+rax-task-runner.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["process", "io-std"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true

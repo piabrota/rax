@@ -25,7 +25,7 @@ use http::{Method, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use rax_api::v1alpha1::{Condition, Task, TaskSpec, TaskStatus, Workspace};
-use rax_api::{DEFAULT_TASK_IMAGE, condition, phase, reason, to_yaml, validate_resources};
+use rax_api::{DEFAULT_TASK_IMAGE, condition, reason, to_yaml, validate_resources};
 use rax_substrate::tls::{self, TlsOptions};
 use rustls::ClientConfig;
 use serde_json::{Value, json};
@@ -33,7 +33,7 @@ use tonic::Status;
 use tracing::info;
 
 use crate::tasks::now;
-use crate::{Actor, ActorState, Actors, ReconcileError, Reconciler};
+use crate::{Actor, ActorState, Actors, Reconciler};
 
 /// The labels that tie a pod to its task.
 const LABEL_MANAGED: &str = "ax.io/managed-by";
@@ -488,43 +488,30 @@ fn set_condition(st: &mut TaskStatus, kind: &str, status: &str, reason: &str, me
     }
 }
 
-/// A failed call with the task as far as it got: Pending when retrying may
-/// work, Failed otherwise.
-fn fail(mut task: Task, err: &KubeError, context: &str, failed_reason: &str) -> ReconcileError {
+/// Records a failed call on the task as a False Ready condition:
+/// SubstrateUnavailable when retrying may work, `failed_reason` otherwise.
+fn fail(task: &mut Task, err: &KubeError, context: &str, failed_reason: &str) -> Status {
     let st = task.status.get_or_insert_with(Default::default);
-    if err.is_transient() {
-        set_condition(
-            st,
-            condition::READY,
-            "False",
-            reason::SUBSTRATE_UNAVAILABLE,
-            format!("{context}: {err}"),
-        );
-        st.phase = phase::PENDING.into();
+    let reason = if err.is_transient() {
+        reason::SUBSTRATE_UNAVAILABLE
     } else {
-        set_condition(
-            st,
-            condition::READY,
-            "False",
-            failed_reason,
-            format!("{context}: {err}"),
-        );
-        st.phase = phase::FAILED.into();
-    }
-    ReconcileError {
-        task: Some(task),
-        status: err.to_status(context),
-    }
+        failed_reason
+    };
+    set_condition(
+        st,
+        condition::READY,
+        "False",
+        reason,
+        format!("{context}: {err}"),
+    );
+    err.to_status(context)
 }
 
-#[async_trait]
-impl Reconciler for PodRunner {
-    async fn reconcile(
-        &self,
-        mut task: Task,
-        workspace: Option<Workspace>,
-    ) -> Result<Task, ReconcileError> {
-        let atespace = atespace_of(&task);
+impl PodRunner {
+    /// Fills in the task's defaults and ID, checks its limits, and lists the
+    /// pods it has run in.
+    async fn prepare(&self, task: &mut Task, failed_reason: &str) -> Result<Vec<Value>, Status> {
+        let atespace = atespace_of(task);
         task.metadata.get_or_insert_with(Default::default).atespace = atespace.clone();
         let name = task.metadata.as_ref().unwrap().name.clone();
         let spec = task.spec.get_or_insert_with(TaskSpec::default);
@@ -532,19 +519,15 @@ impl Reconciler for PodRunner {
             spec.image = self.opts.default_task_image.clone();
         }
         let resources = spec.resources.clone();
-        {
-            let st = task.status.get_or_insert_with(Default::default);
-            st.actor = name.clone();
-            if st.id.is_empty() {
-                let secs = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or_default();
-                st.id = format!("task-{name}-{secs}");
-            }
+        let st = task.status.get_or_insert_with(Default::default);
+        if st.id.is_empty() {
+            let secs = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default();
+            st.id = format!("task-{name}-{secs}");
         }
         if let Err(e) = validate_resources(resources.as_ref()) {
-            let st = task.status.as_mut().unwrap();
             set_condition(
                 st,
                 condition::READY,
@@ -552,100 +535,83 @@ impl Reconciler for PodRunner {
                 reason::INVALID_RESOURCES,
                 e.to_string(),
             );
-            st.phase = phase::FAILED.into();
-            return Err(ReconcileError {
-                task: Some(task),
-                status: Status::invalid_argument(format!("validating resources: {e}")),
-            });
+            return Err(Status::invalid_argument(format!(
+                "validating resources: {e}"
+            )));
         }
+        self.pods(&atespace, Some(&name))
+            .await
+            .map_err(|e| fail(task, &e, "listing the task's pods", failed_reason))
+    }
+}
 
-        let pods = match self.pods(&atespace, Some(&name)).await {
-            Ok(p) => p,
-            Err(e) => {
+#[async_trait]
+impl Reconciler for PodRunner {
+    /// Stops a run in progress and keeps finished pods for their logs.
+    async fn suspend(&self, task: &mut Task, _workspace: Option<Workspace>) -> Result<(), Status> {
+        let pods = self.prepare(task, reason::ACTOR_CREATION_FAILED).await?;
+        let running: Vec<Value> = pods.into_iter().filter(|p| !is_finished(p)).collect();
+        if !running.is_empty() {
+            info!(
+                atespace = atespace_of(task),
+                task = task.metadata.as_ref().map(|m| m.name.as_str()),
+                "deleting the task's running pod"
+            );
+        }
+        self.delete_pods(&running)
+            .await
+            .map_err(|e| e.to_status("deleting the task's pod"))
+    }
+
+    /// Keeps a run in progress; otherwise a new pod replaces the finished
+    /// ones.
+    async fn resume(&self, task: &mut Task, workspace: Option<Workspace>) -> Result<(), Status> {
+        let pods = self.prepare(task, reason::ACTOR_RESUME_FAILED).await?;
+        if pods.first().is_none_or(is_finished) {
+            if let Err(e) = self.delete_pods(&pods).await {
                 return Err(fail(
                     task,
                     &e,
-                    "listing the task's pods",
-                    reason::ACTOR_CREATION_FAILED,
+                    "deleting the task's old pods",
+                    reason::ACTOR_RESUME_FAILED,
                 ));
             }
-        };
-        let st = task.status.as_mut().unwrap();
-
-        // Suspend: stop a run in progress, keep finished pods for their logs.
-        if st.phase.is_empty() || st.phase == phase::SUSPENDED {
-            let running: Vec<Value> = pods.into_iter().filter(|p| !is_finished(p)).collect();
-            if !running.is_empty() {
-                info!(atespace, task = name, "deleting the task's running pod");
-            }
-            if let Err(e) = self.delete_pods(&running).await {
+            // Milliseconds, so two runs never share a pod name.
+            let run = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or_default();
+            let pod = pod_manifest(task, workspace.as_ref(), &self.opts, run);
+            info!(
+                atespace = atespace_of(task),
+                task = task.metadata.as_ref().map(|m| m.name.as_str()),
+                pod = pod["metadata"]["name"].as_str(),
+                "creating the task's pod"
+            );
+            if let Err(e) = self
+                .client
+                .request(Method::POST, &self.pods_path(), Some(&pod))
+                .await
+            {
                 return Err(fail(
                     task,
                     &e,
-                    "deleting the task's pod",
-                    reason::ACTOR_CREATION_FAILED,
+                    "creating the task's pod",
+                    reason::ACTOR_RESUME_FAILED,
                 ));
             }
-            let st = task.status.as_mut().unwrap();
-            st.worker_ip.clear();
-            st.phase = phase::SUSPENDED.into();
-            return Ok(task);
         }
-
-        // Resume: a run in progress stays; otherwise a new pod replaces the
-        // finished ones.
-        let worker = match pods.first().filter(|p| !is_finished(p)) {
-            Some(p) => p["status"]["podIP"].as_str().unwrap_or_default().to_owned(),
-            None => {
-                if let Err(e) = self.delete_pods(&pods).await {
-                    return Err(fail(
-                        task,
-                        &e,
-                        "deleting the task's old pods",
-                        reason::ACTOR_RESUME_FAILED,
-                    ));
-                }
-                // Milliseconds, so two runs never share a pod name.
-                let run = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or_default();
-                let pod = pod_manifest(&task, workspace.as_ref(), &self.opts, run);
-                info!(
-                    atespace,
-                    task = name,
-                    pod = pod["metadata"]["name"].as_str(),
-                    "creating the task's pod"
-                );
-                if let Err(e) = self
-                    .client
-                    .request(Method::POST, &self.pods_path(), Some(&pod))
-                    .await
-                {
-                    return Err(fail(
-                        task,
-                        &e,
-                        "creating the task's pod",
-                        reason::ACTOR_RESUME_FAILED,
-                    ));
-                }
-                String::new()
-            }
-        };
-        let st = task.status.as_mut().unwrap();
-        st.worker_ip = worker;
-        st.phase = phase::RUNNING.into();
         set_condition(
-            st,
+            task.status.get_or_insert_with(Default::default),
             condition::WORKSPACE_READY,
             "True",
             reason::SETUP_COMPLETE,
             "The pod runner sets up no workspace".into(),
         );
-        Ok(task)
+        Ok(())
     }
 
-    async fn reconcile_delete(&self, atespace: &str, name: &str) -> Result<(), Status> {
+    async fn delete(&self, atespace: &str, name: &str) -> Result<(), Status> {
         let atespace = if atespace.is_empty() {
             "default"
         } else {
@@ -722,6 +688,7 @@ mod tests {
     use rax_api::v1alpha1::{EnvVar, ObjectMeta, ResourceList, ResourcesSpec};
 
     use super::*;
+    use rax_api::phase;
 
     /// A fake Kubernetes API that keeps pods in memory: list by label,
     /// create (as Pending, with increasing creation times) and delete.
@@ -988,22 +955,16 @@ mod tests {
         let runner = PodRunner::new(serve(api.clone()).await, opts());
 
         // Created: suspended, no pod.
-        let t = runner
-            .reconcile(task("digest", phase::SUSPENDED), None)
-            .await
-            .unwrap();
-        assert_eq!(t.status.as_ref().unwrap().phase, phase::SUSPENDED);
+        runner.suspend(&mut task("digest", ""), None).await.unwrap();
         assert!(api.names().is_empty());
         let a = runner.get_actor("ops", "digest").await.unwrap().unwrap();
         assert_eq!(a.state, ActorState::Suspended);
 
         // Resumed: one pod; resuming again while it runs keeps it.
-        let t = runner
-            .reconcile(task("digest", phase::RUNNING), None)
-            .await
-            .unwrap();
+        let mut t = task("digest", "");
+        runner.resume(&mut t, None).await.unwrap();
         let st = t.status.as_ref().unwrap();
-        assert_eq!(st.phase, phase::RUNNING);
+        assert_eq!(st.phase, "", "the phase is the server's to set");
         assert!(
             st.conditions
                 .iter()
@@ -1012,36 +973,24 @@ mod tests {
         let first = api.names();
         assert_eq!(first.len(), 1);
         assert!(first[0].starts_with("ops-digest-"), "{first:?}");
-        runner
-            .reconcile(task("digest", phase::RUNNING), None)
-            .await
-            .unwrap();
+        runner.resume(&mut task("digest", ""), None).await.unwrap();
         assert_eq!(api.names(), first);
 
         // It ends: the task reads as suspended, and the pod stays for its logs.
         api.set_phase(&first[0], "Succeeded", json!({}));
         let a = runner.get_actor("ops", "digest").await.unwrap().unwrap();
         assert_eq!(a.state, ActorState::Suspended);
-        runner
-            .reconcile(task("digest", phase::SUSPENDED), None)
-            .await
-            .unwrap();
+        runner.suspend(&mut task("digest", ""), None).await.unwrap();
         assert_eq!(api.names(), first);
 
         // Resumed again: the old pod goes, a new one runs.
-        runner
-            .reconcile(task("digest", phase::RUNNING), None)
-            .await
-            .unwrap();
+        runner.resume(&mut task("digest", ""), None).await.unwrap();
         let second = api.names();
         assert_eq!(second.len(), 1);
         assert_ne!(second, first);
 
         // Suspended while running: the pod is deleted.
-        runner
-            .reconcile(task("digest", phase::SUSPENDED), None)
-            .await
-            .unwrap();
+        runner.suspend(&mut task("digest", ""), None).await.unwrap();
         assert!(api.names().is_empty());
     }
 
@@ -1049,14 +998,8 @@ mod tests {
     async fn listing_and_deleting_follow_the_labels() {
         let api = FakeApi::default();
         let runner = PodRunner::new(serve(api.clone()).await, opts());
-        runner
-            .reconcile(task("a", phase::RUNNING), None)
-            .await
-            .unwrap();
-        runner
-            .reconcile(task("b", phase::RUNNING), None)
-            .await
-            .unwrap();
+        runner.resume(&mut task("a", ""), None).await.unwrap();
+        runner.resume(&mut task("b", ""), None).await.unwrap();
         let names = api.names();
         api.set_phase(&names[0], "Failed", json!({"containerStatuses": [{"state": {"terminated": {"exitCode": 1, "reason": "Error"}}}]}));
 
@@ -1073,20 +1016,23 @@ mod tests {
         );
         assert!(runner.list_actors("other").await.unwrap().is_empty());
 
-        runner.reconcile_delete("ops", "a").await.unwrap();
+        runner.delete("ops", "a").await.unwrap();
         assert_eq!(api.names(), vec![names[1].clone()]);
     }
 
     #[tokio::test]
-    async fn an_unreachable_api_leaves_the_task_pending() {
+    async fn an_unreachable_api_is_worth_retrying() {
         // Nothing listens on port 1.
         let runner = PodRunner::new(KubeClient::plaintext("127.0.0.1", 1), opts());
-        let err = runner
-            .reconcile(task("digest", phase::RUNNING), None)
-            .await
-            .unwrap_err();
-        let st = err.task.unwrap().status.unwrap();
-        assert_eq!(st.phase, phase::PENDING);
-        assert_eq!(err.status.code(), tonic::Code::Unavailable);
+        let mut t = task("digest", "");
+        let err = runner.resume(&mut t, None).await.unwrap_err();
+        // The server records Pending for an Unavailable error.
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        let st = t.status.unwrap();
+        assert!(
+            st.conditions
+                .iter()
+                .any(|c| c.r#type == condition::READY && c.reason == reason::SUBSTRATE_UNAVAILABLE)
+        );
     }
 }

@@ -109,7 +109,7 @@ impl Tasks {
         name: &str,
     ) -> Result<(), Status> {
         if let Some(r) = reconciler
-            && let Err(e) = r.reconcile_delete(atespace, name).await
+            && let Err(e) = r.delete(atespace, name).await
         {
             return Err(match e.code() {
                 tonic::Code::Unknown => Status::internal(format!(

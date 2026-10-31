@@ -1436,6 +1436,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rax-claude-code-runner"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "pbjson-types",
+ "rax-api",
+ "rax-task-runner",
+ "regex",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "rax-cli"
 version = "0.1.0"
 dependencies = [

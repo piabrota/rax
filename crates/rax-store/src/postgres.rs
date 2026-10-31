@@ -611,6 +611,58 @@ mod tests {
         guard.release().await;
     }
 
+    /// Port of AX's TestRestartKeepsTasksAndReleasesLocks: a server crashes
+    /// holding a lock, and a new one opens the same database. The task is
+    /// still there, and the lock can be taken once its lease runs out.
+    #[tokio::test]
+    async fn restart_keeps_tasks_and_releases_locks() {
+        let _serial = SERIAL.lock().await;
+        let opts = PostgresOptions {
+            lock_ttl: Duration::from_millis(300),
+            lock_retry_interval: Duration::from_millis(20),
+            ..Default::default()
+        };
+        let Some(s1) = open(opts.clone()).await else {
+            return;
+        };
+        drop(s1);
+        let url = std::env::var("RAX_TEST_POSTGRES_URL").unwrap();
+
+        // The first server runs on its own runtime, which is torn down with
+        // the lock still held: its lease is never released or renewed again.
+        let (crash_url, crash_opts) = (url.clone(), opts.clone());
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let s = PostgresStore::open(&crash_url, crash_opts).await.unwrap();
+                s.save_task(&mut testing::task("default", "survivor"))
+                    .await
+                    .unwrap();
+                let guard = s.lock("task", "default", "survivor").await.unwrap();
+                std::mem::forget(guard);
+            });
+            rt.shutdown_background();
+        })
+        .join()
+        .unwrap();
+
+        // Reopen without truncating, so the data from before the crash is kept.
+        let s2 = PostgresStore::open(&url, opts).await.unwrap();
+        let got = s2.get_task("default", "survivor").await.unwrap();
+        assert_eq!(got.metadata.unwrap().name, "survivor");
+        let guard = tokio::time::timeout(
+            Duration::from_secs(5),
+            s2.lock("task", "default", "survivor"),
+        )
+        .await
+        .expect("the crashed server's lease must expire")
+        .unwrap();
+        guard.release().await;
+    }
+
     #[test]
     fn describes_urls_without_passwords() {
         for (url, want) in [

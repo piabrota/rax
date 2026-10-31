@@ -1,6 +1,7 @@
 //! The AX service against an in-memory store, with Substrate stood in for by
 //! fake reconcilers and actor readers.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -8,9 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rax_api::v1alpha1::{self as api, *};
 use rax_api::{phase, reason};
-use rax_server::{
-    Actor, ActorState, Actors, AxService, ReconcileError, Reconciler, ServerOptions, router,
-};
+use rax_server::{Actor, ActorState, Actors, AxService, Reconciler, ServerOptions, router};
 use rax_store::{MemoryStore, ResourceStore, StoreError, TaskStore};
 use tonic::{Code, Status};
 
@@ -49,7 +48,8 @@ fn service(store: Arc<MemoryStore>, opts: ServerOptions) -> AxService {
     AxService::new(store, opts)
 }
 
-/// A reconciler that records what it was asked and fails on demand.
+/// A reconciler that records what it was asked and fails on demand. It also
+/// reads back the actors it drove, as Substrate would.
 #[derive(Default)]
 struct FakeReconciler {
     state: Mutex<FakeState>,
@@ -57,15 +57,18 @@ struct FakeReconciler {
 
 #[derive(Default)]
 struct FakeState {
-    reconciles: usize,
+    /// Suspends and resumes.
+    calls: usize,
     deletes: usize,
-    reconcile_err: Option<Status>,
-    reconcile_phase: String,
-    reconcile_conditions: Option<Vec<Condition>>,
+    err: Option<Status>,
+    /// The conditions a failed call leaves on the task.
+    err_conditions: Option<Vec<Condition>>,
     observed: Option<Task>,
     delete_err: Option<Status>,
     /// Runs on delete, with the task's stored record at that moment.
     on_delete: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// The state of each task's actor, by task name.
+    actors: HashMap<String, ActorState>,
 }
 
 impl FakeReconciler {
@@ -81,55 +84,94 @@ impl FakeReconciler {
 
     fn counts(&self) -> (usize, usize) {
         let s = self.state.lock().unwrap();
-        (s.reconciles, s.deletes)
+        (s.calls, s.deletes)
     }
 
     fn observed(&self) -> Task {
         self.state.lock().unwrap().observed.clone().unwrap()
     }
+
+    fn drive(&self, task: &mut Task, to: ActorState) -> Result<(), Status> {
+        let mut s = self.state.lock().unwrap();
+        s.calls += 1;
+        s.observed = Some(task.clone());
+        if let Some(err) = s.err.clone() {
+            if let Some(c) = &s.err_conditions {
+                task.status.get_or_insert_with(Default::default).conditions = c.clone();
+            }
+            return Err(err);
+        }
+        let name = task.metadata.as_ref().unwrap().name.clone();
+        s.actors.insert(name, to);
+        Ok(())
+    }
+
+    fn actor(name: &str, state: ActorState) -> Actor {
+        Actor {
+            name: name.into(),
+            state,
+            worker_ip: if state == ActorState::Running {
+                "10.244.1.42".into()
+            } else {
+                String::new()
+            },
+            crash_message: String::new(),
+        }
+    }
 }
 
 #[async_trait]
 impl Reconciler for FakeReconciler {
-    async fn reconcile(
-        &self,
-        mut task: Task,
-        _ws: Option<Workspace>,
-    ) -> Result<Task, ReconcileError> {
-        let mut s = self.state.lock().unwrap();
-        s.reconciles += 1;
-        s.observed = Some(task.clone());
-        if let Some(err) = s.reconcile_err.clone() {
-            let st = task.status.get_or_insert_with(Default::default);
-            if !s.reconcile_phase.is_empty() {
-                st.phase = s.reconcile_phase.clone();
-            }
-            if let Some(c) = &s.reconcile_conditions {
-                st.conditions = c.clone();
-            }
-            return Err(ReconcileError {
-                task: Some(task),
-                status: err,
-            });
-        }
-        let phase = phase_of(&task).to_owned();
-        task.status = Some(TaskStatus {
-            phase,
-            ..Default::default()
-        });
-        Ok(task)
+    async fn suspend(&self, task: &mut Task, _ws: Option<Workspace>) -> Result<(), Status> {
+        self.drive(task, ActorState::Suspended)
     }
 
-    async fn reconcile_delete(&self, _atespace: &str, _name: &str) -> Result<(), Status> {
+    async fn resume(&self, task: &mut Task, _ws: Option<Workspace>) -> Result<(), Status> {
+        self.drive(task, ActorState::Running)
+    }
+
+    async fn delete(&self, _atespace: &str, name: &str) -> Result<(), Status> {
         let (hook, err) = {
             let mut s = self.state.lock().unwrap();
             s.deletes += 1;
+            if s.delete_err.is_none() {
+                s.actors.remove(name);
+            }
             (s.on_delete.clone(), s.delete_err.clone())
         };
         if let Some(h) = hook {
             h();
         }
         err.map_or(Ok(()), Err)
+    }
+}
+
+#[async_trait]
+impl Actors for FakeReconciler {
+    async fn get_actor(&self, atespace: &str, name: &str) -> Result<Option<Actor>, Status> {
+        let s = self.state.lock().unwrap();
+        Ok((atespace == "default")
+            .then(|| s.actors.get(name).map(|st| Self::actor(name, *st)))
+            .flatten())
+    }
+
+    async fn list_actors(&self, atespace: &str) -> Result<Vec<Actor>, Status> {
+        let s = self.state.lock().unwrap();
+        Ok(if atespace == "default" {
+            s.actors.iter().map(|(n, st)| Self::actor(n, *st)).collect()
+        } else {
+            vec![]
+        })
+    }
+}
+
+/// Options that drive and read actors through `rec`, as rax-server does
+/// through one Substrate client.
+fn on(rec: Arc<FakeReconciler>) -> ServerOptions {
+    ServerOptions {
+        reconciler: Some(rec.clone()),
+        actors: Some(rec),
+        ..Default::default()
     }
 }
 
@@ -465,13 +507,7 @@ async fn validates_workspace_binding() {
 #[tokio::test]
 async fn reconciler_lifecycle() {
     let rec = Arc::new(FakeReconciler::default());
-    let svc = service(
-        Arc::new(MemoryStore::new()),
-        ServerOptions {
-            reconciler: Some(rec.clone()),
-            ..Default::default()
-        },
-    );
+    let svc = service(Arc::new(MemoryStore::new()), on(rec.clone()));
 
     let t = svc
         .create_task(new_task("task-rec", "alpine"))
@@ -531,13 +567,7 @@ async fn delete_marks_terminating_while_cleaning_up() {
             }))
         });
     }
-    let svc = service(
-        store,
-        ServerOptions {
-            reconciler: Some(rec),
-            ..Default::default()
-        },
-    );
+    let svc = service(store, on(rec));
     svc.create_task(new_task("task-term", "alpine"))
         .await
         .unwrap();
@@ -559,13 +589,7 @@ async fn delete_keeps_task_when_cleanup_fails() {
     let rec = FakeReconciler::with(|s| {
         s.delete_err = Some(Status::unknown("substrate timeout deleting actor"))
     });
-    let svc = service(
-        Arc::new(MemoryStore::new()),
-        ServerOptions {
-            reconciler: Some(rec),
-            ..Default::default()
-        },
-    );
+    let svc = service(Arc::new(MemoryStore::new()), on(rec));
     svc.create_task(new_task("task-err", "alpine"))
         .await
         .unwrap();
@@ -642,13 +666,7 @@ impl ResourceStore for FailingStore {
 async fn delete_stops_when_status_update_fails() {
     let store = Arc::new(FailingStore::default());
     let rec = Arc::new(FakeReconciler::default());
-    let svc = AxService::new(
-        store.clone(),
-        ServerOptions {
-            reconciler: Some(rec.clone()),
-            ..Default::default()
-        },
-    );
+    let svc = AxService::new(store.clone(), on(rec.clone()));
     svc.create_task(new_task("task-status-fail", "alpine"))
         .await
         .unwrap();
@@ -664,7 +682,7 @@ async fn delete_stops_when_status_update_fails() {
     assert_eq!(
         rec.counts().1,
         0,
-        "ReconcileDelete must not run when the status update fails"
+        "Delete must not run when the status update fails"
     );
 }
 
@@ -699,8 +717,8 @@ async fn save_running(store: &MemoryStore, name: &str) {
 #[tokio::test]
 async fn failed_suspend_keeps_running_state() {
     let store = Arc::new(MemoryStore::new());
-    let rec =
-        FakeReconciler::with(|s| s.reconcile_err = Some(Status::unknown("substrate unavailable")));
+    let rec = FakeReconciler::with(|s| s.err = Some(Status::unknown("substrate unavailable")));
+    // No actor reader: the stored status is what a read returns.
     let svc = service(
         store.clone(),
         ServerOptions {
@@ -729,13 +747,7 @@ async fn failed_suspend_keeps_running_state() {
 #[tokio::test]
 async fn successful_suspend_stores_no_actor_state() {
     let store = Arc::new(MemoryStore::new());
-    let svc = service(
-        store.clone(),
-        ServerOptions {
-            reconciler: Some(Arc::new(FakeReconciler::default())),
-            ..Default::default()
-        },
-    );
+    let svc = service(store.clone(), on(Arc::new(FakeReconciler::default())));
     save_running(&store, "task-suspend-ok").await;
     let t = svc
         .suspend_task(SuspendTaskRequest {
@@ -804,13 +816,7 @@ async fn reads_actor_state_from_substrate() {
 #[tokio::test]
 async fn new_tasks_start_suspended() {
     let store = Arc::new(MemoryStore::new());
-    let svc = service(
-        store.clone(),
-        ServerOptions {
-            reconciler: Some(Arc::new(FakeReconciler::default())),
-            ..Default::default()
-        },
-    );
+    let svc = service(store.clone(), on(Arc::new(FakeReconciler::default())));
     let t = svc
         .create_task(new_task("task-create-suspended", "alpine"))
         .await
@@ -826,16 +832,9 @@ async fn new_tasks_start_suspended() {
 
 #[tokio::test]
 async fn failed_provisioning_marks_failed() {
-    let rec = FakeReconciler::with(|s| {
-        s.reconcile_err = Some(Status::unknown("substrate suspend actor failure"))
-    });
-    let svc = service(
-        Arc::new(MemoryStore::new()),
-        ServerOptions {
-            reconciler: Some(rec),
-            ..Default::default()
-        },
-    );
+    let rec =
+        FakeReconciler::with(|s| s.err = Some(Status::unknown("substrate suspend actor failure")));
+    let svc = service(Arc::new(MemoryStore::new()), on(rec));
     let err = svc
         .create_task(new_task("task-create-fail", "alpine"))
         .await
@@ -856,22 +855,15 @@ async fn failed_provisioning_marks_failed() {
 #[tokio::test]
 async fn recovers_from_transient_substrate_outage() {
     let rec = FakeReconciler::with(|s| {
-        s.reconcile_err = Some(Status::unavailable("connection refused"));
-        s.reconcile_phase = phase::PENDING.into();
-        s.reconcile_conditions = Some(vec![Condition {
+        s.err = Some(Status::unavailable("connection refused"));
+        s.err_conditions = Some(vec![Condition {
             r#type: "Ready".into(),
             status: "False".into(),
             reason: reason::SUBSTRATE_UNAVAILABLE.into(),
             ..Default::default()
         }]);
     });
-    let svc = service(
-        Arc::new(MemoryStore::new()),
-        ServerOptions {
-            reconciler: Some(rec.clone()),
-            ..Default::default()
-        },
-    );
+    let svc = service(Arc::new(MemoryStore::new()), on(rec.clone()));
 
     // Creating while Substrate is unreachable records Pending, not Failed.
     let err = svc
@@ -890,7 +882,7 @@ async fn recovers_from_transient_substrate_outage() {
     assert_eq!(err.code(), Code::FailedPrecondition);
 
     // Re-applying with the status omitted keeps the stored conditions.
-    rec.set(|s| s.reconcile_conditions = None);
+    rec.set(|s| s.err_conditions = None);
     let err = svc
         .create_task(new_task("simple-task", "alpine"))
         .await
@@ -922,8 +914,7 @@ async fn recovers_from_transient_substrate_outage() {
 
     // Once Substrate recovers, the same apply succeeds and keeps the creation time.
     rec.set(|s| {
-        s.reconcile_err = None;
-        s.reconcile_phase.clear();
+        s.err = None;
     });
     let created = svc
         .create_task(new_task("simple-task", "alpine"))
@@ -937,8 +928,7 @@ async fn recovers_from_transient_substrate_outage() {
 
     // A brief outage during resume keeps the task Pending instead of Failed.
     rec.set(|s| {
-        s.reconcile_err = Some(Status::unavailable("substrate restarting"));
-        s.reconcile_phase = phase::PENDING.into();
+        s.err = Some(Status::unavailable("substrate restarting"));
     });
     let err = svc
         .resume_task(ResumeTaskRequest {
@@ -985,13 +975,7 @@ async fn update_keeps_creation_time() {
 #[tokio::test]
 async fn concurrent_creates_of_one_task_are_serialized() {
     let rec = Arc::new(FakeReconciler::default());
-    let svc = service(
-        Arc::new(MemoryStore::new()),
-        ServerOptions {
-            reconciler: Some(rec.clone()),
-            ..Default::default()
-        },
-    );
+    let svc = service(Arc::new(MemoryStore::new()), on(rec.clone()));
     let runs: Vec<_> = (0..8)
         .map(|_| {
             let svc = svc.clone();
@@ -1007,4 +991,77 @@ async fn concurrent_creates_of_one_task_are_serialized() {
     }
     assert_eq!(ok, 1, "exactly one create must win");
     assert_eq!(rec.counts().0, 1);
+}
+
+/// Port of AX's TestServer_SuccessClearsStoredFailure: a task whose create
+/// failed reads as Failed until a suspend or resume succeeds, after which its
+/// phase comes from the actor again.
+#[tokio::test]
+async fn success_clears_a_stored_failure() {
+    let rec = Arc::new(FakeReconciler::default());
+    let svc = service(Arc::new(MemoryStore::new()), on(rec.clone()));
+    let create_failed = |name: &'static str| {
+        let (svc, rec) = (svc.clone(), rec.clone());
+        async move {
+            rec.set(|s| s.err = Some(Status::internal("substrate suspend failure")));
+            let err = svc.create_task(new_task(name, "alpine")).await.unwrap_err();
+            assert_eq!(err.code(), Code::Internal);
+            rec.set(|s| s.err = None);
+            let t = svc.get_task(get(name)).await.unwrap();
+            assert_eq!(phase_of(&t), phase::FAILED, "{name} after a failed create");
+        }
+    };
+
+    create_failed("task-suspend").await;
+    let t = svc
+        .suspend_task(SuspendTaskRequest {
+            name: "task-suspend".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(phase_of(&t), "Suspended");
+
+    create_failed("task-resume").await;
+    let t = svc
+        .resume_task(ResumeTaskRequest {
+            name: "task-resume".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(phase_of(&t), "Running");
+    assert_eq!(
+        phase_of(&svc.get_task(get("task-resume")).await.unwrap()),
+        "Running"
+    );
+}
+
+/// A suspend after a failed delete clears its Terminating, which cancels the
+/// deletion, as in AX.
+#[tokio::test]
+async fn suspending_cancels_a_failed_delete() {
+    let rec = FakeReconciler::with(|s| s.delete_err = Some(Status::unavailable("timeout")));
+    let svc = service(Arc::new(MemoryStore::new()), on(rec));
+    svc.create_task(new_task("task-undelete", "alpine"))
+        .await
+        .unwrap();
+    svc.delete_task(DeleteTaskRequest {
+        name: "task-undelete".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(
+        phase_of(&svc.get_task(get("task-undelete")).await.unwrap()),
+        phase::TERMINATING
+    );
+    let t = svc
+        .suspend_task(SuspendTaskRequest {
+            name: "task-undelete".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(phase_of(&t), "Suspended");
 }

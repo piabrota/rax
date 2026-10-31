@@ -25,6 +25,10 @@ image tag="rax-server:local":
 runner-image tag="rax-task-runner:local":
     docker build -f Dockerfile.task-runner -t {{tag}} .
 
+# Build the Claude Code task image on top of the task-runner image (AX's `make build-claude-code-image`). Pin a Claude Code release with CLAUDE_CODE_VERSION.
+claude-code-image tag="rax-claude-code:local": (runner-image)
+    docker build -f Dockerfile.claude-code --build-arg CLAUDE_CODE_VERSION=${CLAUDE_CODE_VERSION:-latest} -t {{tag}} .
+
 # Replay AX's end-to-end scenarios without Kubernetes. Point RAX_E2E_CLI, RAX_E2E_RUNNER or RAX_E2E_SERVER at AX's Go binaries to mix implementations.
 e2e-local *args:
     cargo test -p rax-cli --test e2e_local {{args}}

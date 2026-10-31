@@ -3,7 +3,8 @@
 //!
 //! A task's actor on Agent Substrate is the source of truth for whether the
 //! task is running, where, and whether it is healthy. The server reads that
-//! through [`Actors`] and drives actors through a [`Reconciler`]; both are
+//! through [`Actors`] and suspends, resumes and deletes actors through a
+//! [`Reconciler`]; both are
 //! implemented on top of the Substrate client.
 
 pub mod controller;
@@ -77,31 +78,24 @@ pub trait Actors: Send + Sync {
     }
 }
 
-/// Coordinates sandbox and actor lifecycles on Agent Substrate.
+/// Coordinates sandbox and actor lifecycles on Agent Substrate, as AX's
+/// `controller.TaskReconciler` does.
+///
+/// [`suspend`](Self::suspend) and [`resume`](Self::resume) first make sure the
+/// task's atespace, template and actor exist. They record on `task` only what
+/// AX stores in a task's status: its ID, the `WorkspaceReady` condition, and on
+/// failure the reason in a False `Ready` condition. The caller sets the phase,
+/// and the server reads the rest of the status from the actor.
 #[async_trait]
 pub trait Reconciler: Send + Sync {
-    /// Drives the task's actor toward `task.status.phase` and returns the task
-    /// with its new status.
-    async fn reconcile(
-        &self,
-        task: Task,
-        workspace: Option<Workspace>,
-    ) -> Result<Task, ReconcileError>;
+    /// Provisions the task's actor and suspends it. A failure to suspend the
+    /// actor itself is returned without changing the task's status.
+    async fn suspend(&self, task: &mut Task, workspace: Option<Workspace>) -> Result<(), Status>;
+    /// Provisions the task's actor, resumes it, and waits a little for its
+    /// workspace to be set up, recording the result in `WorkspaceReady`.
+    async fn resume(&self, task: &mut Task, workspace: Option<Workspace>) -> Result<(), Status>;
     /// Removes the task's actor and templates from Substrate.
-    async fn reconcile_delete(&self, atespace: &str, name: &str) -> Result<(), Status>;
-}
-
-/// A failed reconcile, with the task's status as far as it got when known.
-#[derive(Debug)]
-pub struct ReconcileError {
-    pub task: Option<Task>,
-    pub status: Status,
-}
-
-impl From<Status> for ReconcileError {
-    fn from(status: Status) -> Self {
-        Self { task: None, status }
-    }
+    async fn delete(&self, atespace: &str, name: &str) -> Result<(), Status>;
 }
 
 /// Reports whether a Substrate error is worth retrying: Substrate was

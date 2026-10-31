@@ -169,19 +169,19 @@ impl AxService {
             .save(&task)
             .await
             .map_err(internal("saving task"))?;
-        // New tasks start suspended.
-        task.status.as_mut().unwrap().phase = phase::SUSPENDED.into();
 
-        if let Some(r) = &self.reconciler {
-            let ws = self.fetch_workspace(atespace, &task).await;
-            match r.reconcile(task.clone(), ws).await {
-                Ok(reconciled) => task.status = reconciled.status,
-                Err(e) => {
-                    tracing::error!(task = %format!("{atespace}/{name}"), error = %e.status.message(), "reconciling new task");
-                    self.record_failure(&mut task, atespace, name, &e).await;
-                    return Err(substrate_error("provisioning task on substrate", &e.status));
+        // New tasks start suspended.
+        match &self.reconciler {
+            Some(r) => {
+                let ws = self.fetch_workspace(atespace, &task).await;
+                if let Err(e) = r.suspend(&mut task, ws).await {
+                    return Err(self.record_failure(&mut task, "provisioning", &e).await);
                 }
+                // The actor exists, so reads take the task's phase from it
+                // from now on.
+                task.status.as_mut().unwrap().phase.clear();
             }
+            None => task.status.as_mut().unwrap().phase = phase::SUSPENDED.into(),
         }
         self.tasks
             .update(atespace, name, task.status.as_ref())
@@ -193,31 +193,31 @@ impl AxService {
         Ok(task)
     }
 
-    /// Records a failed provisioning or resume: Pending when Substrate may
-    /// still come back, Failed otherwise.
-    async fn record_failure(
-        &self,
-        task: &mut Task,
-        atespace: &str,
-        name: &str,
-        e: &crate::ReconcileError,
-    ) {
-        if let Some(st) = e.task.as_ref().and_then(|t| t.status.clone()) {
-            task.status = Some(st);
-        }
+    /// Stores the status of a task that could not be provisioned or resumed:
+    /// phase Pending if `err` is a transient Substrate error, which a retry
+    /// may fix, and Failed otherwise. Returns the error for `action`.
+    async fn record_failure(&self, task: &mut Task, action: &str, err: &Status) -> Status {
+        let meta = task.metadata.clone().unwrap_or_default();
+        tracing::error!(
+            task = %format!("{}/{}", meta.atespace, meta.name),
+            error = %err.message(),
+            "{action} task on substrate failed"
+        );
         let st = task.status.get_or_insert_with(TaskStatus::default);
-        if is_transient(&e.status) {
-            st.phase = phase::PENDING.into();
-        } else if st.phase != phase::PENDING {
-            st.phase = phase::FAILED.into();
+        st.phase = if is_transient(err) {
+            phase::PENDING
+        } else {
+            phase::FAILED
         }
-        if let Err(err) = self
+        .into();
+        if let Err(e) = self
             .tasks
-            .update(atespace, name, task.status.as_ref())
+            .update(&meta.atespace, &meta.name, task.status.as_ref())
             .await
         {
-            tracing::warn!(error = %err, "recording task failure");
+            tracing::warn!(error = %e, "recording task failure");
         }
+        substrate_error(&format!("{action} task on substrate"), err)
     }
 
     pub async fn delete_task(
@@ -255,15 +255,26 @@ impl AxService {
                 .get(&atespace, &name)
                 .await
                 .map_err(read_error("task", &name, &atespace))?;
-            task.status.get_or_insert_with(Default::default).phase = phase::SUSPENDED.into();
-            if let Some(r) = &self.reconciler {
-                let ws = self.fetch_workspace(&atespace, &task).await;
-                // A failed suspension leaves the task as it was.
-                let reconciled = r
-                    .reconcile(task.clone(), ws)
-                    .await
-                    .map_err(|e| substrate_error("suspending task on substrate", &e.status))?;
-                task.status = reconciled.status;
+            match &self.reconciler {
+                Some(r) => {
+                    let ws = self.fetch_workspace(&atespace, &task).await;
+                    // Store nothing on failure: the actor keeps its state on
+                    // Substrate, and a stored Pending or Failed would hide it.
+                    r.suspend(&mut task, ws)
+                        .await
+                        .map_err(|e| substrate_error("suspending task on substrate", &e))?;
+                    // Clear any Pending or Failed left by an earlier failure,
+                    // so reads take the phase from the actor. This also clears
+                    // the Terminating left by a failed delete, which cancels
+                    // that deletion.
+                    task.status
+                        .get_or_insert_with(Default::default)
+                        .phase
+                        .clear();
+                }
+                None => {
+                    task.status.get_or_insert_with(Default::default).phase = phase::SUSPENDED.into()
+                }
             }
             self.tasks
                 .update(&atespace, &name, task.status.as_ref())
@@ -284,15 +295,20 @@ impl AxService {
                 .get(&atespace, &name)
                 .await
                 .map_err(read_error("task", &name, &atespace))?;
-            task.status.get_or_insert_with(Default::default).phase = phase::RUNNING.into();
-            if let Some(r) = &self.reconciler {
-                let ws = self.fetch_workspace(&atespace, &task).await;
-                match r.reconcile(task.clone(), ws).await {
-                    Ok(reconciled) => task.status = reconciled.status,
-                    Err(e) => {
-                        self.record_failure(&mut task, &atespace, &name, &e).await;
-                        return Err(substrate_error("resuming task on substrate", &e.status));
+            match &self.reconciler {
+                Some(r) => {
+                    let ws = self.fetch_workspace(&atespace, &task).await;
+                    if let Err(e) = r.resume(&mut task, ws).await {
+                        return Err(self.record_failure(&mut task, "resuming", &e).await);
                     }
+                    // As in suspend_task: reads take the phase from the actor.
+                    task.status
+                        .get_or_insert_with(Default::default)
+                        .phase
+                        .clear();
+                }
+                None => {
+                    task.status.get_or_insert_with(Default::default).phase = phase::RUNNING.into()
                 }
             }
             self.tasks

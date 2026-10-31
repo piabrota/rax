@@ -167,26 +167,20 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         insecure_tls: args.substrate_insecure_tls,
         plaintext: args.substrate_plaintext,
     });
-    match client {
-        Ok(client) => {
-            let reconciler = TaskReconciler::new(
-                client.clone(),
-                ControllerOptions {
-                    default_template: args.template,
-                    default_template_atespace: args.template_atespace,
-                    default_task_image: args.default_task_image,
-                    router_addr: std::env::var("ATENET_ROUTER_ADDR").unwrap_or_default(),
-                    ..Default::default()
-                },
-            );
-            opts.reconciler = Some(Arc::new(reconciler));
-            opts.actors = Some(Arc::new(SubstrateActors::new(client)));
-        }
-        Err(e) => tracing::warn!(
-            error = %e,
-            "could not initialize substrate client; running without substrate reconciliation"
-        ),
-    }
+    // As in AX, the server needs Substrate: without it no task could run.
+    let client = client.map_err(|e| format!("initializing substrate client: {e}"))?;
+    let reconciler = TaskReconciler::new(
+        client.clone(),
+        ControllerOptions {
+            default_template: args.template,
+            default_template_atespace: args.template_atespace,
+            default_task_image: args.default_task_image,
+            router_addr: std::env::var("ATENET_ROUTER_ADDR").unwrap_or_default(),
+            ..Default::default()
+        },
+    );
+    opts.reconciler = Some(Arc::new(reconciler));
+    opts.actors = Some(Arc::new(SubstrateActors::new(client)));
     serve(&args.addr, AxService::new(store, opts)).await
 }
 
