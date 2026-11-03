@@ -860,6 +860,76 @@ pub fn escalate_interrupts(
     rx
 }
 
+/// Connects to a task's guest services: directly when the worker is
+/// reachable, else through Substrate's atenet router (mTLS on 443, falling
+/// back to plaintext on 80). Returns the port-forward the connection runs
+/// over, if any.
+fn dial_guest(
+    host: &str,
+    port: u16,
+    target_actor: &str,
+    kube_context: &str,
+    ax_namespace: &str,
+) -> Result<(GuestClient, Option<tunnel::PortForward>), Error> {
+    // 1. The worker directly, when it is reachable (in-cluster or a mesh).
+    let endpoint = join_host_port(host, port);
+    let direct = endpoint
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut a| a.next())
+        .is_some_and(|a| TcpStream::connect_timeout(&a, Duration::from_millis(500)).is_ok());
+    if direct {
+        let c = GuestClient::connect(&endpoint, None, None)
+            .map_err(|e| format!("connecting to guest at {endpoint}: {e}"))?;
+        return Ok((c, None));
+    }
+
+    // 2. Through Substrate's atenet router: mTLS on 443, else plaintext 80.
+    let ax_namespace = if ax_namespace.is_empty() {
+        rax_api::DEFAULT_SYSTEM_NAMESPACE
+    } else {
+        ax_namespace
+    };
+    let setup_err = match dial_router_tls(target_actor, kube_context, ax_namespace)? {
+        Ok(connected) => return Ok(connected),
+        Err(setup_err) => setup_err,
+    };
+    let pf = tunnel::port_forward(kube_context, "ate-system", "svc/atenet-router", 80)
+        .map_err(|e| format!("establishing port-forward to atenet-router: {e} ({setup_err})"))?;
+    let router = format!("127.0.0.1:{}", pf.port);
+    let c = GuestClient::connect(&router, Some(target_actor), None)
+        .map_err(|e| format!("connecting to guest via atenet-router at {router}: {e}"))?;
+    Ok((c, Some(pf)))
+}
+
+/// Connects to the guest through the atenet router over mTLS on 443. The
+/// outer error is a failed connection, which ends `rax ssh`; the inner one is
+/// a failure to set up mTLS or the port-forward, after which the plaintext
+/// route is tried.
+#[allow(clippy::type_complexity)]
+fn dial_router_tls(
+    target_actor: &str,
+    kube_context: &str,
+    ax_namespace: &str,
+) -> Result<Result<(GuestClient, Option<tunnel::PortForward>), String>, Error> {
+    let tls = match router_tls_config(kube_context, ax_namespace, "ax-server") {
+        Ok(tls) => tls,
+        Err(e) => return Ok(Err(format!("mTLS setup error: {e}"))),
+    };
+    let pf = match tunnel::port_forward(kube_context, "ate-system", "svc/atenet-router", 443) {
+        Ok(pf) => pf,
+        Err(e) => return Ok(Err(format!("port 443 forward error: {e}"))),
+    };
+    let router = format!("127.0.0.1:{}", pf.port);
+    let c = GuestClient::connect(
+        &router,
+        Some(target_actor),
+        Some((tls, ROUTER_SERVER_NAME.to_owned())),
+    )
+    .map_err(|e| format!("connecting to guest via atenet-router at {router}: {e}"))?;
+    Ok(Ok((c, Some(pf))))
+}
+
 fn stdin_is_terminal() -> bool {
     // SAFETY: isatty only inspects the descriptor.
     unsafe { libc::isatty(0) == 1 }
@@ -870,6 +940,7 @@ pub async fn run_ssh(
     server: &str,
     atespace: &str,
     kube_context: &str,
+    ax_namespace: &str,
     args: &[String],
 ) -> Result<i32, Error> {
     let parsed = parse_ssh_args(args)?;
@@ -906,54 +977,8 @@ pub async fn run_ssh(
 
     let (host, port) = guest_endpoint(&status.worker_ip);
     let target_actor = format!("{}/{}", meta_of(&task.metadata).1, status.actor);
-    let endpoint = join_host_port(&host, port);
-    // Kept alive for the session.
-    let mut _forward = None;
-
-    // 1. The worker directly, when it is reachable (in-cluster or a mesh).
-    let direct = endpoint
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut a| a.next())
-        .is_some_and(|a| TcpStream::connect_timeout(&a, Duration::from_millis(500)).is_ok());
-    let guest = if direct {
-        GuestClient::connect(&endpoint, None, None)
-            .map_err(|e| format!("connecting to guest at {endpoint}: {e}"))?
-    } else {
-        // 2. Through Substrate's atenet router: mTLS on 443, else plaintext 80.
-        let ax_namespace = std::env::var("AX_SYSTEM_NAMESPACE")
-            .ok()
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| rax_api::DEFAULT_SYSTEM_NAMESPACE.into());
-        let mut via_tls = None;
-        if let Ok(tls) = router_tls_config(kube_context, &ax_namespace, "ax-server")
-            && let Ok(pf) =
-                tunnel::port_forward(kube_context, "ate-system", "svc/atenet-router", 443)
-        {
-            let router = format!("127.0.0.1:{}", pf.port);
-            let c = GuestClient::connect(
-                &router,
-                Some(&target_actor),
-                Some((tls, ROUTER_SERVER_NAME.to_owned())),
-            )
-            .map_err(|e| format!("connecting to guest via atenet-router at {router}: {e}"))?;
-            _forward = Some(pf);
-            via_tls = Some(c);
-        }
-        match via_tls {
-            Some(c) => c,
-            None => {
-                let pf = tunnel::port_forward(kube_context, "ate-system", "svc/atenet-router", 80)
-                    .map_err(|e| format!("establishing port-forward to atenet-router: {e}"))?;
-                let router = format!("127.0.0.1:{}", pf.port);
-                let c = GuestClient::connect(&router, Some(&target_actor), None).map_err(|e| {
-                    format!("connecting to guest via atenet-router at {router}: {e}")
-                })?;
-                _forward = Some(pf);
-                c
-            }
-        }
-    };
+    // The port-forward, if any, is kept alive for the session.
+    let (guest, _forward) = dial_guest(&host, port, &target_actor, kube_context, ax_namespace)?;
 
     // A bare shell on a terminal runs interactively, so it prompts and Ctrl-C
     // stops what it runs rather than the shell.

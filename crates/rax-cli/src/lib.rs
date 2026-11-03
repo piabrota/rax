@@ -131,13 +131,18 @@ pub fn run(argv: Vec<String>) -> i32 {
             "ssh" => {
                 // ssh leaves through process::exit so a blocked stdin read
                 // can't hold the runtime open.
-                let code =
-                    match commands::run_ssh(&server, &atespace, &opts.kube_context, &opts.args)
-                        .await
-                    {
-                        Ok(code) => code,
-                        Err(e) => fail(e),
-                    };
+                let code = match commands::run_ssh(
+                    &server,
+                    &atespace,
+                    &opts.kube_context,
+                    &opts.namespace,
+                    &opts.args,
+                )
+                .await
+                {
+                    Ok(code) => code,
+                    Err(e) => fail(e),
+                };
                 std::process::exit(code);
             }
             _ => unreachable!(),

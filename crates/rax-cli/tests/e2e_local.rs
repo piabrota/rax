@@ -566,14 +566,14 @@ async fn task_lifecycle_and_substrate_sync() {
             .as_ref()
             .unwrap();
         assert_eq!((probe.path.as_str(), probe.port), ("/readyz", 80));
-        assert!(
-            !tmpl
-                .snapshot_config
-                .as_ref()
-                .unwrap()
-                .storage_location
-                .is_empty()
+        // A SnapshotConfig at volume fidelity, with no template-level
+        // location so Substrate 1.0 uses its cluster-wide one.
+        let snap = tmpl.snapshot_config.as_ref().unwrap();
+        assert_eq!(
+            snap.preferred_fidelity,
+            rax_substrate::ateapi::SnapshotFidelity::Volumes as i32
         );
+        assert!(snap.storage_location.is_empty());
         tmpl_name
     };
 

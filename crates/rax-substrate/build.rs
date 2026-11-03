@@ -1,10 +1,10 @@
-//! Generates the Agent Substrate control API client from proto/ateapi/ateapi.proto.
+//! Generates the Agent Substrate control API client from proto/ateapi/v1/ateapi.proto.
 
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../proto");
-    let proto = root.join("ateapi/ateapi.proto");
+    let proto = root.join("ateapi/v1/ateapi.proto");
     println!("cargo:rerun-if-changed={}", proto.display());
 
     let fds = protox::compile([&proto], [&root])?;

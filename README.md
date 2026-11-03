@@ -160,7 +160,7 @@ refuses leaves the task `Pending`, to retry.
 ## Parity with AX
 
 **RAX covers everything AX ships**, as of AX's `main` at
-[`f0228f1`](https://github.com/google/ax/commit/f0228f1) (2026-10-30): the
+[`6e970c5`](https://github.com/google/ax/commit/6e970c5) (2026-11-03): the
 control plane (`ax-server`), the process inside each task container
 (`ax-task-runner`, including the guest services `ax ssh` talks to), the
 Claude Code runner and its image, and the CLI (`ax`, with its tunnels). The
@@ -183,12 +183,12 @@ and runner, and so on (see [What is tested](#what-is-tested)).
 | `pkg/apis/v1alpha1` (types, resources) | Task, Workspace and Model types, YAML and JSON encoding, name and spec validation, CPU and memory quantities | `rax-api` | done |
 | `internal/store`, `store/memory`, `store/postgres` | Resource store; PostgreSQL with AX's schema | `rax-store` | done (no TLS to PostgreSQL yet) |
 | `internal/lock`, `store/postgres/lock.go` | Per-resource locks; PostgreSQL leases with renewal and takeover | `rax-store` | done |
-| `internal/server` | The `ax.v1alpha1.AX` gRPC API (all 14 RPCs), actor-owned status, `/healthz` | `rax-server` | done |
+| `internal/server` | The `ax.v1alpha1.AX` gRPC API (all 14 RPCs), actor-owned status, bound workspaces checked before a task is stored, `/healthz` | `rax-server` | done |
 | `cmd/ax-server` | Server binary, flags and environment | `rax-server` binary | done (same flags) |
-| `internal/substrate` | Substrate control API client: TLS, token, retries, atespaces, templates, actors | `rax-substrate` | done |
+| `internal/substrate` | Substrate control API client (`substrate.ateapi.v1`, Substrate v1.0.0-rc.1): TLS, token, retries, atespaces, templates with the cluster-wide snapshot location, actors | `rax-substrate` | done |
 | `internal/controller` | Task reconciler: per-task templates, explicit `Suspend`, `Resume` and `Delete`, workspace readiness, delete cleanup | `rax-server::controller` | done |
 | `cmd/ax` | CLI: `apply`, `get`, `describe`, `suspend`, `resume`, `delete`, `ssh`, `ctx`/`context`, `tunnel list`/`stop`, `version` | `rax-cli` (`rax`) | done (same flags, output and exit codes) |
-| `internal/tunnel` | CLI tunnels: per-context state, `kubectl port-forward`, router TLS through a PodCertificateRequest | `rax-cli::tunnel`, `rax-cli::router_tls` | done (same state and cache files) |
+| `internal/tunnel` | CLI tunnels: per-context state, `kubectl port-forward`, router TLS through a PodCertificateRequest, cached no longer than the certificate is valid | `rax-cli::tunnel`, `rax-cli::router_tls` | done (same state and cache files) |
 | `internal/guest` | Client for the in-actor guest daemon (`ax ssh`: exec, stdin, signals, Ctrl-C twice to leave) | `rax-guest::client` | done |
 | Substrate `env/guest` (embedded by AX's runner) | Guest daemon: process service with spooled output, stdin, signals, limits; filesystem service; reflection | `rax-guest` | done |
 | `cmd/ax-task-runner`, `runner` | The process inside each task container: runs setup, then supervises the task's command | `rax-task-runner` | done (same flags, `-flag` spellings too) |
@@ -227,7 +227,7 @@ and runner, and so on (see [What is tested](#what-is-tested)).
 
 ### What is tested
 
-167 tests, all run in CI (`cargo test --all`, with a PostgreSQL 16 service).
+172 tests, all run in CI (`cargo test --all`, with a PostgreSQL 16 service).
 They port the Go tests for the packages above and add some of their own.
 
 | Suite | Tests | Covers |
@@ -235,16 +235,16 @@ They port the Go tests for the packages above and add some of their own.
 | `rax-api` unit | 21 | YAML round trips and strict decoding (unknown fields rejected), lenient decoding, Workspace MCP and Model secret-key spellings, task config, workspace binding, name/meta/task/file validation, resource validation, CPU and memory parsing |
 | `rax-store` unit | 12 | One conformance suite run on both the memory and the PostgreSQL store (CRUD, defaults, paging, not-found), concurrent schema creation, records with unknown fields, lock serialization, cancellation, lease renewal and takeover of expired leases, a crashed server's tasks kept and its locks freed after a restart, URL redaction |
 | `rax-server` unit | 15 | Actor state to task phase and Ready, stored status keeps only AX's fields, `/healthz`, template naming and digest, the template name pattern, worker and router addresses, Go-style `:port` listen addresses; the pod runner's manifests, pod phases, retryable errors, one run per resume and label-scoped listing |
-| `rax-server` `tests/service.rs` | 17 | gRPC round trip over the real router, invalid names, workspace binding, suspend and resume lifecycle, delete (terminating, cleanup failure, status write failure), suspend success and failure, actor state read from Substrate, new tasks start suspended, failed and transiently failed provisioning, a later success clearing a stored failure, a suspend cancelling a failed delete, creation time kept, concurrent creates serialized |
+| `rax-server` `tests/service.rs` | 18 | gRPC round trip over the real router, invalid names, workspace binding, bound workspace required (missing, other atespace, store error), suspend and resume lifecycle, delete (terminating, cleanup failure, status write failure), suspend success and failure, actor state read from Substrate, new tasks start suspended, failed and transiently failed provisioning, a later success clearing a stored failure, a suspend cancelling a failed delete, creation time kept, concurrent creates serialized |
 | `rax-server` `tests/controller.rs` | 17 | Ports of AX's reconciler tests against an in-memory Substrate: actor named after the task, worker IP, default image, suspend and failed suspend, rejected template (bare Substrate message, no fallback), transient template failure, workspace readiness polled directly and through the router and kept across suspend and resume, no new template on status changes, resource limits and their failure paths, delete removes only the task's templates, waits for the actor, times out, transient failures and recovery; plus a full create, resume, get, suspend and delete through the service |
-| `rax-substrate` unit | 12 | Retry and backoff rules, transient errors, template building, snapshot location, resource limits, TLS config, HTTP readiness probe |
+| `rax-substrate` unit | 11 | Retry and backoff rules, transient errors, template building (no snapshot location unless given), resource limits, TLS config, HTTP readiness probe |
 | `rax-substrate` `tests/client.rs` | 13 | Client against an in-memory Substrate: atespace, template and actor creation, revert or recreate of crashed actors, waiting out deleting actors, resume retries (`ResourceExhausted` not retried), delete polling, missing actors and timeout, template deletion retries, pagination, token re-read on every call |
 | `rax-substrate` `tests/tls.rs` | 1 | A real TLS connection: CA file, authority override, wrong server name rejected, unreadable CA, skip-verify |
 | `rax-guest` unit | 9 | Output spooling and replay from offsets, exit codes and signal exits (128+n), stdin writes and close, signals to the process group, the concurrency cap, log truncation, the default timeout, pruning, start failures, timeouts, path cleaning and confinement, the signal table |
 | `rax-task-runner` unit | 8 | First-run marker, git clone into a subdirectory with depth, git errors withholding the marker, inlined files, marker names, clone destinations, spec loading with unknown fields and empty specs |
 | `rax-task-runner` `tests/runner.rs` | 8 | Ports of AX's runner, metadata and guest client tests: command env, working directory and exit code, serving after the command exits, stopping the command's process group, waiting without a command, bound workspace setup and readiness, metadata only on loopback, guest services only with `spec.debug`, exec with stdin, empty stdin, exit codes and forwarded signals |
 | `rax-claude-code-runner` unit | 7 | Ports of AX's claude-code-runner tests: rejected configs, the minimal invocation, flags by value type in sorted order, the Workspace's MCP servers as `--mcp-config` byte for byte, Go-style JSON escaping and numbers, `spec.command` left alone |
-| `rax-cli` unit | 15 | Ports of AX's argument parsing, `ssh` argument and Ctrl-C escalation tests, tunnel context names and the port-forward pattern, AX's tunnel state files, tabwriter-style tables, Go `%v` values, document splitting, kinds, worker addresses, router TLS configs |
+| `rax-cli` unit | 20 | Ports of AX's argument parsing (with `-n` over `$AX_SYSTEM_NAMESPACE`), `ssh` argument and Ctrl-C escalation tests, tunnel context names and the port-forward pattern, AX's tunnel state files, tabwriter-style tables, Go `%v` values, document splitting, kinds, worker addresses, router TLS configs, router certificate expiry in the cache |
 | `rax-cli` `tests/cli.rs` | 5 | Ports of AX's CLI tests, running the `rax` binary against rax-server: `apply` atespaces for every kind, immutable tasks, `unchanged` and `configured`, empty and invalid documents, `get` aliases and missing resources, exact `describe` output, `delete`, and the offline commands (`version`, `ctx`, `tunnel list`/`stop`, usage) |
 | `rax-cli` `tests/e2e_local.rs` | 7 | AX's seven E2E scenarios, replayed without Kubernetes through the CLI binary against rax-server, an in-memory Substrate and real task-runners: CLI version, workspace and model CRUD, task lifecycle and Substrate sync, metadata server and guest exec, workspace setup with files and git, suspend and resume persistence, describe and atespace isolation |
 

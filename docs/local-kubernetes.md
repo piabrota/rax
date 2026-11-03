@@ -11,7 +11,8 @@ the control plane and the CLI are RAX's, from this checkout; `RUNNER=ax`,
 `ax`, one at a time or together.
 
 > **Status: not yet run end to end.** The scripts were written against AX's
-> kind setup and Substrate v0.6.0's installer and are statically checked
+> kind setup and Substrate's installer (v0.6.0's, then v1.0.0-rc.1's
+> `ate-setup`) and are statically checked
 > (shellcheck, `just --dry-run`), but no cluster has been brought up with
 > them yet: the environment they were written in cannot give a nested
 > cluster network access. Expect to hit rough edges on the first run, and see
@@ -122,8 +123,9 @@ manifests from `test/e2e/manifests` unchanged:
    the port (`--ports=127.0.0.1:5001:5001`). A `kind-registry` Service in
    `ate-system` stands in for kind's registry container, which Substrate's
    atelet pulls task images from.
-2. **Substrate.** Substrate's `hack/install-ate-kind.sh deploy ate-system`
-   with AX's flags, pointed at this cluster's context. Substrate's kind
+2. **Substrate.** Substrate's `ate-setup --kind deploy ate-system` (or
+   `hack/install-ate-kind.sh` on versions before 1.0) with AX's flags,
+   pointed at this cluster's context. Substrate's kind
    profile fits any single local node: in-cluster Postgres, RustFS for
    snapshots, and no cloud credential provider. The installed commit is
    recorded on the `ate-system` namespace, and a different one is uninstalled
@@ -181,9 +183,11 @@ Use `SERVER=ax`, `RUNNER=ax` or `CLI=ax` to tell a RAX bug from a setup problem.
   cluster without them. `ax-server`'s manifest mounts a `podCertificate` and a
   `clusterTrustBundle` projected volume, so the server cannot start without
   them either. Kubernetes 1.34 or newer is needed; v1.37.0 is the default.
-- **A Substrate version with `hack/install-ate-kind.sh`.** The version AX
-  pins (v0.6.0 at the time of writing) has it; Substrate's `main` branch no
-  longer does, so `SUBSTRATE_REF=main` does not work here.
+- **A Substrate version AX's kind setup supports.** Substrate v1.0 installs
+  with `go run ./cmd/ate-setup --kind`, which AX's `hack/setup-e2e-kind.sh`
+  now uses and so does `deploy` (v1.0.0-rc.1 is the version AX pins at the
+  time of writing); older versions with `hack/install-ate-kind.sh` still
+  work. Either way Go is needed on the host to run the installer.
 - **Docker on the host**, even for MicroK8s: the images are built with it,
   and Substrate's installer checks `docker info` in its kind profile.
 - **gVisor only.** Micro-VM sandbox classes (kata with cloud-hypervisor) need

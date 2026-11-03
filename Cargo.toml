@@ -60,3 +60,4 @@ rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem
 tonic-reflection = "0.14"
 rax-guest = { path = "crates/rax-guest" }
 rax-task-runner = { path = "crates/rax-task-runner" }
+x509-parser = { version = "0.16", default-features = false }

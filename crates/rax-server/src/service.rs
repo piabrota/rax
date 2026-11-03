@@ -159,6 +159,31 @@ impl AxService {
             Err(e) => return Err(Status::internal(format!("checking existing task: {e}"))),
         }
 
+        // Tasks are immutable, so a task created before its Workspace would
+        // keep an empty workspace for its whole life. Reject it instead.
+        let workspace = match task
+            .spec
+            .as_ref()
+            .and_then(|s| s.workspace.as_ref())
+            .map(|w| w.name.as_str())
+            .filter(|n| !n.is_empty())
+        {
+            None => None,
+            Some(ws_name) => match self.resources.get_workspace(atespace, ws_name).await {
+                Ok(ws) => Some(ws),
+                Err(StoreError::NotFound) => {
+                    return Err(Status::failed_precondition(format!(
+                        "workspace {ws_name:?} not found in atespace {atespace:?}"
+                    )));
+                }
+                Err(e) => {
+                    return Err(Status::internal(format!(
+                        "getting workspace {ws_name:?}: {e}"
+                    )));
+                }
+            },
+        };
+
         let meta = task.metadata.as_mut().expect("metadata was defaulted");
         if meta.create_time.is_none() {
             meta.create_time = Some(now());
@@ -173,8 +198,7 @@ impl AxService {
         // New tasks start suspended.
         match &self.reconciler {
             Some(r) => {
-                let ws = self.fetch_workspace(atespace, &task).await;
-                if let Err(e) = r.suspend(&mut task, ws).await {
+                if let Err(e) = r.suspend(&mut task, workspace).await {
                     return Err(self.record_failure(&mut task, "provisioning", &e).await);
                 }
                 // The actor exists, so reads take the task's phase from it

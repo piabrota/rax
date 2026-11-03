@@ -69,6 +69,8 @@ struct FakeState {
     on_delete: Option<Arc<dyn Fn() + Send + Sync>>,
     /// The state of each task's actor, by task name.
     actors: HashMap<String, ActorState>,
+    /// The workspace the last suspend or resume was given.
+    workspace: Option<Workspace>,
 }
 
 impl FakeReconciler {
@@ -122,11 +124,13 @@ impl FakeReconciler {
 
 #[async_trait]
 impl Reconciler for FakeReconciler {
-    async fn suspend(&self, task: &mut Task, _ws: Option<Workspace>) -> Result<(), Status> {
+    async fn suspend(&self, task: &mut Task, ws: Option<Workspace>) -> Result<(), Status> {
+        self.state.lock().unwrap().workspace = ws;
         self.drive(task, ActorState::Suspended)
     }
 
-    async fn resume(&self, task: &mut Task, _ws: Option<Workspace>) -> Result<(), Status> {
+    async fn resume(&self, task: &mut Task, ws: Option<Workspace>) -> Result<(), Status> {
+        self.state.lock().unwrap().workspace = ws;
         self.drive(task, ActorState::Running)
     }
 
@@ -493,6 +497,14 @@ async fn validates_workspace_binding() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::InvalidArgument);
+    svc.update_workspace(UpdateWorkspaceRequest {
+        workspace: Some(Workspace {
+            metadata: meta("a"),
+            ..Default::default()
+        }),
+    })
+    .await
+    .unwrap();
     svc.create_task(bind(
         "good",
         WorkspaceRef {
@@ -610,6 +622,8 @@ async fn delete_keeps_task_when_cleanup_fails() {
 struct FailingStore {
     inner: MemoryStore,
     fail_updates: AtomicBool,
+    /// What every workspace lookup fails with, if anything.
+    get_workspace_err: Mutex<Option<StoreError>>,
 }
 
 #[async_trait]
@@ -640,6 +654,9 @@ impl ResourceStore for FailingStore {
         self.inner.save_workspace(ws).await
     }
     async fn get_workspace(&self, a: &str, n: &str) -> rax_store::Result<Workspace> {
+        if let Some(e) = self.get_workspace_err.lock().unwrap().take() {
+            return Err(e);
+        }
         self.inner.get_workspace(a, n).await
     }
     async fn list_workspaces(&self, a: &str) -> rax_store::Result<Vec<Workspace>> {
@@ -659,6 +676,151 @@ impl ResourceStore for FailingStore {
     }
     async fn delete_model(&self, a: &str, n: &str) -> rax_store::Result<()> {
         self.inner.delete_model(a, n).await
+    }
+}
+
+/// A task is immutable, so CreateTask must not save or provision a task whose
+/// Workspace does not exist yet: it would run with an empty workspace forever.
+#[tokio::test]
+async fn create_task_requires_bound_workspace() {
+    struct Case {
+        name: &'static str,
+        task_atespace: &'static str,
+        /// Where the "data" Workspace exists; empty for nowhere.
+        ws_atespace: &'static str,
+        binding: &'static str,
+        get_err: Option<StoreError>,
+        want_code: Code,
+        want_msg: &'static str,
+    }
+    let base = || Case {
+        name: "",
+        task_atespace: "",
+        ws_atespace: "",
+        binding: "data",
+        get_err: None,
+        want_code: Code::Ok,
+        want_msg: "",
+    };
+    for tc in [
+        Case {
+            name: "missing",
+            want_code: Code::FailedPrecondition,
+            want_msg: r#"workspace "data" not found in atespace "default""#,
+            ..base()
+        },
+        Case {
+            name: "other atespace",
+            task_atespace: "team-a",
+            ws_atespace: "team-b",
+            want_code: Code::FailedPrecondition,
+            want_msg: r#"workspace "data" not found in atespace "team-a""#,
+            ..base()
+        },
+        Case {
+            name: "store error",
+            get_err: Some(StoreError::Backend("store unavailable".into())),
+            want_code: Code::Internal,
+            want_msg: r#"getting workspace "data": store unavailable"#,
+            ..base()
+        },
+        Case {
+            name: "present",
+            ws_atespace: "default",
+            ..base()
+        },
+        Case {
+            name: "present in task atespace",
+            task_atespace: "team-a",
+            ws_atespace: "team-a",
+            ..base()
+        },
+        Case {
+            name: "no binding",
+            binding: "",
+            ..base()
+        },
+    ] {
+        let store = Arc::new(FailingStore::default());
+        *store.get_workspace_err.lock().unwrap() = tc.get_err;
+        if !tc.ws_atespace.is_empty() {
+            store
+                .inner
+                .save_workspace(&mut Workspace {
+                    metadata: Some(ObjectMeta {
+                        atespace: tc.ws_atespace.into(),
+                        name: "data".into(),
+                        ..Default::default()
+                    }),
+                    spec: Some(WorkspaceSpec::default()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let rec = Arc::new(FakeReconciler::default());
+        let svc = AxService::new(store.clone(), on(rec.clone()));
+        let task = Task {
+            metadata: Some(ObjectMeta {
+                atespace: tc.task_atespace.into(),
+                name: "task".into(),
+                ..Default::default()
+            }),
+            spec: Some(TaskSpec {
+                image: "alpine".into(),
+                workspace: (!tc.binding.is_empty()).then(|| WorkspaceRef {
+                    name: tc.binding.into(),
+                    path: String::new(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let result = svc
+            .create_task(CreateTaskRequest { task: Some(task) })
+            .await;
+        let (code, msg) = match &result {
+            Ok(_) => (Code::Ok, String::new()),
+            Err(e) => (e.code(), e.message().to_owned()),
+        };
+        assert_eq!(code, tc.want_code, "{}: {msg}", tc.name);
+        assert!(msg.contains(tc.want_msg), "{}: {msg:?}", tc.name);
+
+        let atespace = if tc.task_atespace.is_empty() {
+            "default"
+        } else {
+            tc.task_atespace
+        };
+        let stored = store.inner.get_task(atespace, "task").await;
+        if tc.want_code != Code::Ok {
+            assert!(
+                matches!(stored, Err(StoreError::NotFound)),
+                "{}: rejected task was stored",
+                tc.name
+            );
+            assert_eq!(
+                rec.counts(),
+                (0, 0),
+                "{}: rejected task was provisioned",
+                tc.name
+            );
+            continue;
+        }
+        stored.unwrap_or_else(|e| panic!("{}: stored task: {e}", tc.name));
+        assert_eq!(
+            rec.counts(),
+            (1, 0),
+            "{}: accepted task not provisioned",
+            tc.name
+        );
+        // The reconciler gets the workspace the server resolved.
+        let ws = rec.state.lock().unwrap().workspace.clone();
+        assert_eq!(
+            ws.and_then(|w| w.metadata).map(|m| m.name),
+            (!tc.binding.is_empty()).then(|| "data".to_owned()),
+            "{}",
+            tc.name
+        );
     }
 }
 

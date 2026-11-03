@@ -64,8 +64,6 @@ AX_REF="${AX_REF:-main}"
 # AX's ax-server manifest and Substrate's bootstrap owners both assume this.
 export AX_SYSTEM_NAMESPACE=ax-system
 export AX_WORKER_REPLICAS="${AX_WORKER_REPLICAS:-2}"
-# Substrate's kind profile serves snapshots from in-cluster RustFS at this bucket.
-export AX_SNAPSHOTS_BUCKET="${AX_SNAPSHOTS_BUCKET:-gs://ate-snapshots/ax/}"
 # The registry in registry.yaml, as the node and the host both see it.
 REGISTRY_ADDR=localhost:5001
 
@@ -349,14 +347,14 @@ resolve_substrate_dir() {
       git -C "${SUBSTRATE_DIR}" checkout --quiet --detach "${ref}"
     fi
   fi
-  [[ -x "${SUBSTRATE_DIR}/hack/install-ate-kind.sh" ]] ||
-    die "${SUBSTRATE_DIR} has no hack/install-ate-kind.sh; use a Substrate version AX supports"
+  [[ -x "${SUBSTRATE_DIR}/hack/install-ate-kind.sh" || -d "${SUBSTRATE_DIR}/cmd/ate-setup" ]] ||
+    die "${SUBSTRATE_DIR} has neither hack/install-ate-kind.sh nor cmd/ate-setup; use a Substrate version AX supports"
   SUBSTRATE_COMMIT="$(git -C "${SUBSTRATE_DIR}" rev-parse HEAD)"
   log "Using Substrate at ${SUBSTRATE_DIR} (${SUBSTRATE_COMMIT:0:12})"
 }
 
 # render substitutes only the AX_* variables in one of AX's E2E manifests.
-MANIFEST_VARS=(AX_SYSTEM_NAMESPACE AX_WORKER_REPLICAS AX_SERVER_IMAGE AX_DEFAULT_TASK_IMAGE AX_SNAPSHOTS_BUCKET)
+MANIFEST_VARS=(AX_SYSTEM_NAMESPACE AX_WORKER_REPLICAS AX_SERVER_IMAGE AX_DEFAULT_TASK_IMAGE)
 render() {
   local manifest="${AX_DIR}/test/e2e/manifests/$1" sed_args=() var
   for var in "${MANIFEST_VARS[@]}"; do
@@ -436,9 +434,16 @@ deploy_substrate() {
   # RustFS for snapshots, no cloud credential provider. Its only kind-specific
   # assumptions are the kind-registry name, which registry.yaml provides, and
   # a reachable Docker daemon, which builds the images anyway.
+  # Substrate 1.0 dropped hack/install-ate-kind.sh for `ate-setup --kind`,
+  # which AX's kind setup now runs; older versions still have the script.
+  local install_cmd=(./hack/install-ate-kind.sh)
+  if [[ ! -f "${SUBSTRATE_DIR}/hack/install-ate-kind.sh" ]]; then
+    install_cmd=(go run ./cmd/ate-setup --kind --context="${KUBE_CONTEXT}")
+  fi
   (
     cd "${SUBSTRATE_DIR}"
-    KUBECTL_CONTEXT="${KUBE_CONTEXT}" KO_DOCKER_REPO="${REGISTRY_ADDR}" ./hack/install-ate-kind.sh \
+    KUBECTL_CONTEXT="${KUBE_CONTEXT}" KO_DOCKER_REPO="${REGISTRY_ADDR}" \
+      KO_DEFAULTPLATFORMS="linux/${NODE_ARCH}" "${install_cmd[@]}" \
       deploy ate-system \
       --rollout-timeout="${SUBSTRATE_ROLLOUT_TIMEOUT:-5m}" \
       --credential-provider='{"enabled":false}' \
