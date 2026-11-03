@@ -10,16 +10,17 @@ pub mod testing;
 pub mod tls;
 
 pub mod ateapi {
-    //! Types and services generated from Substrate's `ateapi.proto`.
+    //! Types and services generated from Substrate's `api/ateapi/v1/ateapi.proto`
+    //! (package `substrate.ateapi.v1`).
     #![allow(clippy::all)]
-    tonic::include_proto!("ateapi");
+    tonic::include_proto!("substrate.ateapi.v1");
 }
 
 pub use client::{Client, ClientOptions, DEFAULT_TARGET, TokenInterceptor, worker_ip};
 pub use retry::RetryPolicy;
 pub use template::{
-    DEFAULT_CPU_MILLICORES, DEFAULT_GUEST_COMMAND, DEFAULT_MEMORY_BYTES, DEFAULT_SNAPSHOTS_BUCKET,
-    build_actor_template, resource_limits,
+    DEFAULT_CPU_MILLICORES, DEFAULT_GUEST_COMMAND, DEFAULT_MEMORY_BYTES, build_actor_template,
+    resource_limits,
 };
 
 use tonic::{Code, Status};

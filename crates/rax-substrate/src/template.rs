@@ -13,9 +13,6 @@ use crate::ateapi::{
 
 /// The command the guest container runs when a template names none.
 pub const DEFAULT_GUEST_COMMAND: &str = "/usr/local/bin/ax-task-runner";
-/// Where snapshots go when neither the caller nor `AX_SNAPSHOTS_BUCKET` names
-/// a location.
-pub const DEFAULT_SNAPSHOTS_BUCKET: &str = "gs://dberkov-gke-dev3/ate-env/";
 /// The CPU limit (1 core) for a task that sets none.
 pub const DEFAULT_CPU_MILLICORES: i64 = 1000;
 /// The memory limit (512 MiB) for a task that sets none.
@@ -43,28 +40,23 @@ pub fn resource_limits(reqs: Option<&ResourcesSpec>) -> Option<ResourceRequireme
     Some(ResourceRequirements { limits: Some(out) })
 }
 
-/// Chooses the snapshot location: the explicit one, else the value of
-/// `AX_SNAPSHOTS_BUCKET` (passed in as `env`), else the default.
-pub(crate) fn snapshots_bucket(explicit: &str, env: Option<String>) -> String {
-    if !explicit.is_empty() {
-        return explicit.to_owned();
-    }
-    env.filter(|b| !b.is_empty())
-        .unwrap_or_else(|| DEFAULT_SNAPSHOTS_BUCKET.to_owned())
-}
-
 /// Builds the template every task actor runs from: one `guest` container
 /// with a `/readyz` wakeup probe and a durable `/workspace` volume,
 /// snapshotted at volume fidelity. Empty arguments take their defaults, and
 /// missing resource limits take [`DEFAULT_CPU_MILLICORES`] and
 /// [`DEFAULT_MEMORY_BYTES`].
+///
+/// `snapshots_bucket` sets the template's own snapshot storage location.
+/// Substrate rejects a non-empty one (`storage_location: Forbidden`) unless
+/// the cluster enables the `PerTemplateSnapshotLocation` preview feature
+/// gate; leaving it empty uses Substrate's cluster-wide snapshot location.
 pub fn build_actor_template(
     atespace: &str,
     name: &str,
     image: &str,
     env: &BTreeMap<String, String>,
     command: &[String],
-    snapshots_bucket_location: &str,
+    snapshots_bucket: &str,
     resources: Option<&ResourceRequirements>,
 ) -> ActorTemplate {
     let atespace = if atespace.is_empty() {
@@ -82,11 +74,6 @@ pub fn build_actor_template(
     } else {
         command.to_vec()
     };
-    let bucket = snapshots_bucket(
-        snapshots_bucket_location,
-        std::env::var("AX_SNAPSHOTS_BUCKET").ok(),
-    );
-
     let limits = resources.and_then(|r| r.limits.as_ref());
     let cpu_millicores = limits
         .map(|l| l.cpu_millicores)
@@ -133,7 +120,7 @@ pub fn build_actor_template(
             ..Default::default()
         }],
         snapshot_config: Some(SnapshotConfig {
-            storage_location: bucket,
+            storage_location: snapshots_bucket.to_owned(),
             preferred_fidelity: SnapshotFidelity::Volumes as i32,
             ..Default::default()
         }),
@@ -155,15 +142,7 @@ mod tests {
     #[test]
     fn builds_the_task_template() {
         let env = BTreeMap::from([("FOO".to_owned(), "BAR".to_owned())]);
-        let tmpl = build_actor_template(
-            "",
-            "test-tmpl",
-            "",
-            &env,
-            &[],
-            "gs://ate-snapshots/ax/",
-            None,
-        );
+        let tmpl = build_actor_template("", "test-tmpl", "", &env, &[], "", None);
         let meta = tmpl.metadata.as_ref().unwrap();
         assert_eq!(meta.atespace, "default");
         assert_eq!(meta.name, "test-tmpl");
@@ -184,22 +163,24 @@ mod tests {
         assert_eq!(c.volume_mounts[0].mount_path, "/workspace");
         assert!(tmpl.volumes[0].durable_dir.is_some());
         let snap = tmpl.snapshot_config.as_ref().unwrap();
-        assert_eq!(snap.storage_location, "gs://ate-snapshots/ax/");
+        // Empty by default, so Substrate 1.0 uses its cluster-wide location.
+        assert_eq!(snap.storage_location, "");
         assert_eq!(snap.preferred_fidelity, SnapshotFidelity::Volumes as i32);
-    }
 
-    #[test]
-    fn snapshot_location_falls_back_to_env_then_default() {
-        assert_eq!(
-            snapshots_bucket("gs://x/", Some("gs://env/".into())),
-            "gs://x/"
+        // An explicit bucket is the template's location.
+        let tmpl = build_actor_template(
+            "",
+            "test-tmpl",
+            "",
+            &BTreeMap::new(),
+            &[],
+            "gs://ate-snapshots/ax/",
+            None,
         );
-        assert_eq!(snapshots_bucket("", Some("gs://env/".into())), "gs://env/");
         assert_eq!(
-            snapshots_bucket("", Some(String::new())),
-            DEFAULT_SNAPSHOTS_BUCKET
+            tmpl.snapshot_config.unwrap().storage_location,
+            "gs://ate-snapshots/ax/"
         );
-        assert_eq!(snapshots_bucket("", None), DEFAULT_SNAPSHOTS_BUCKET);
     }
 
     fn limits(cpu: i64, memory: i64) -> ResourceRequirements {
