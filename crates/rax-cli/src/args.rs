@@ -32,9 +32,18 @@ impl Default for GlobalArgs {
 
 /// Splits out the command name and the global flags. Flags are not
 /// interpreted after `--`, so a command run by `rax ssh <task> -- ...` is
-/// passed through intact.
+/// passed through intact. The system namespace defaults to
+/// `$AX_SYSTEM_NAMESPACE`, then `ax-system`, and `-n`/`--namespace`
+/// overrides both.
 pub fn parse_global_args(args: &[String]) -> GlobalArgs {
+    parse_global_args_with_env(args, std::env::var("AX_SYSTEM_NAMESPACE").ok().as_deref())
+}
+
+fn parse_global_args_with_env(args: &[String], env_namespace: Option<&str>) -> GlobalArgs {
     let mut g = GlobalArgs::default();
+    if let Some(ns) = env_namespace.filter(|n| !n.is_empty()) {
+        g.namespace = ns.into();
+    }
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -239,6 +248,39 @@ mod tests {
         ];
         for (args, want) in cases {
             assert_eq!(parse_global_args(&args), want, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn global_args_namespace_precedence() {
+        for (env, args, want) in [
+            // Defaults to ax-system.
+            (None, v(&["ssh", "task123"]), "ax-system"),
+            (Some(""), v(&["ssh", "task123"]), "ax-system"),
+            // Falls back to AX_SYSTEM_NAMESPACE when -n is omitted.
+            (
+                Some("env-ax-system"),
+                v(&["ssh", "task123"]),
+                "env-ax-system",
+            ),
+            // An explicit -n overrides AX_SYSTEM_NAMESPACE.
+            (
+                Some("env-ax-system"),
+                v(&["-n", "flag-ax-system", "ssh", "task123"]),
+                "flag-ax-system",
+            ),
+            // Even when it names the default.
+            (
+                Some("env-ax-system"),
+                v(&["--namespace=ax-system", "ssh", "task123"]),
+                "ax-system",
+            ),
+        ] {
+            assert_eq!(
+                parse_global_args_with_env(&args, env).namespace,
+                want,
+                "{args:?} with env={env:?}"
+            );
         }
     }
 
