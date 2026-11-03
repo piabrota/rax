@@ -3,8 +3,9 @@
 //! The router's serving CA comes from the live servicedns
 //! ClusterTrustBundle; the client certificate is a short-lived one from the
 //! podidentity signer, requested with a PodCertificateRequest for the AX
-//! server's service account. Credentials are cached for 30 minutes in the
-//! tunnel directory, in the same format AX uses.
+//! server's service account. Credentials are cached in the tunnel directory,
+//! in the same format AX uses, for 30 minutes or until a minute before the
+//! client certificate expires, whichever is sooner.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -25,6 +26,9 @@ const LIVE_BUNDLE_SELECTOR: &str = "podcert.ate.dev/canarying=live";
 /// The name the router's certificate is verified against.
 pub const ROUTER_SERVER_NAME: &str = "atenet-router.ate-system.svc";
 const CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+/// How long before its NotAfter a client certificate is treated as expired,
+/// so it is not used for a connection that outlives it.
+const ROUTER_CERT_EXPIRY: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CachedRouterTls {
@@ -51,7 +55,15 @@ pub fn router_tls_config(
     let (chain_pem, key_pem) = request_pod_identity_cert(&context, namespace, service_account)
         .map_err(|e| format!("requesting podidentity client certificate: {e}"))?;
     let config = client_config(&trust_pem, &chain_pem, &key_pem)?;
-    let expires = chrono::DateTime::<chrono::Utc>::from(SystemTime::now() + CACHE_TTL);
+    let not_after = leaf_not_after(&chain_pem)?;
+    if SystemTime::now() >= not_after {
+        return Err(format!(
+            "issued podidentity client certificate already expired at {}",
+            chrono::DateTime::<chrono::Utc>::from(not_after)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ));
+    }
+    let expires = chrono::DateTime::<chrono::Utc>::from(cache_expiry(SystemTime::now(), not_after));
     let _ = save_cached(
         &context,
         namespace,
@@ -96,6 +108,38 @@ pub fn client_config(
     Ok(Arc::new(config))
 }
 
+/// When credentials written at `now` for a certificate expiring at
+/// `not_after` stop being reused: 30 minutes on, but never past a minute
+/// before the certificate expires.
+fn cache_expiry(now: SystemTime, not_after: SystemTime) -> SystemTime {
+    let ttl = now + CACHE_TTL;
+    let cert = not_after
+        .checked_sub(ROUTER_CERT_EXPIRY)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    ttl.min(cert)
+}
+
+/// Whether a cached certificate expiring at `not_after` may still be used.
+fn usable(now: SystemTime, not_after: SystemTime) -> bool {
+    now + ROUTER_CERT_EXPIRY <= not_after
+}
+
+/// The expiry of the leaf (first) certificate in a PEM chain.
+fn leaf_not_after(chain_pem: &str) -> Result<SystemTime, String> {
+    let leaf = CertificateDer::pem_slice_iter(chain_pem.as_bytes())
+        .next()
+        .ok_or("certificate chain is empty")?
+        .map_err(|e| format!("parsing leaf certificate: {e}"))?;
+    let (_, cert) = x509_parser::parse_x509_certificate(&leaf)
+        .map_err(|e| format!("parsing leaf certificate: {e}"))?;
+    let secs = cert.validity().not_after.timestamp();
+    Ok(if secs >= 0 {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64)
+    } else {
+        SystemTime::UNIX_EPOCH
+    })
+}
+
 fn cache_path(context: &str, namespace: &str, sa: &str) -> Option<std::path::PathBuf> {
     let key = sanitize_context(&format!("{context}-{namespace}-{sa}"));
     tunnel_dir()
@@ -104,10 +148,20 @@ fn cache_path(context: &str, namespace: &str, sa: &str) -> Option<std::path::Pat
 }
 
 fn load_cached(context: &str, namespace: &str, sa: &str) -> Option<Arc<ClientConfig>> {
-    let data = std::fs::read(cache_path(context, namespace, sa)?).ok()?;
+    load_cached_from(&cache_path(context, namespace, sa)?)
+}
+
+fn load_cached_from(path: &std::path::Path) -> Option<Arc<ClientConfig>> {
+    let data = std::fs::read(path).ok()?;
     let cached: CachedRouterTls = serde_json::from_slice(&data).ok()?;
     let expires = chrono::DateTime::parse_from_rfc3339(&cached.expires_at).ok()?;
     if SystemTime::now() > SystemTime::from(expires) {
+        return None;
+    }
+    if !usable(
+        SystemTime::now(),
+        leaf_not_after(&cached.cert_chain_pem).ok()?,
+    ) {
         return None;
     }
     client_config(
@@ -388,6 +442,80 @@ mod tests {
         assert_eq!(u.len(), 36);
         assert_eq!(&u[14..15], "4");
         assert!("89ab".contains(&u[19..20]));
+    }
+
+    fn cert_expiring_at(not_after: SystemTime) -> String {
+        cert_for(&rcgen::KeyPair::generate().unwrap(), not_after)
+    }
+
+    fn cert_for(key: &rcgen::KeyPair, not_after: SystemTime) -> String {
+        let mut params = rcgen::CertificateParams::new(vec!["client".into()]).unwrap();
+        let not_after = chrono::DateTime::<chrono::Utc>::from(not_after).timestamp();
+        params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+        params.not_after = time::OffsetDateTime::from_unix_timestamp(not_after).unwrap();
+        params.self_signed(key).unwrap().pem()
+    }
+
+    #[test]
+    fn reads_leaf_expiry() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        assert_eq!(leaf_not_after(&cert_expiring_at(at)).unwrap(), at);
+        assert!(leaf_not_after("").is_err());
+        assert!(
+            leaf_not_after("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn caches_until_the_certificate_expires() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let min = Duration::from_secs(60);
+        // A long-lived certificate is cached for 30 minutes.
+        assert_eq!(cache_expiry(now, now + 60 * min), now + CACHE_TTL);
+        // A short-lived one until a minute before it expires.
+        assert_eq!(cache_expiry(now, now + 10 * min), now + 9 * min);
+        assert!(cache_expiry(now, now + min / 2) < now);
+    }
+
+    #[test]
+    fn ignores_cached_certificates_near_expiry() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let min = Duration::from_secs(60);
+        assert!(usable(now, now + 10 * min));
+        assert!(usable(now, now + min));
+        // Within the margin, or expired.
+        assert!(!usable(now, now + min / 2));
+        assert!(!usable(now, now - min));
+    }
+
+    #[test]
+    fn rejects_expired_cache_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca = rcgen::CertificateParams::new(vec![ROUTER_SERVER_NAME.into()])
+            .unwrap()
+            .self_signed(&ca_key)
+            .unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        for (not_after, want) in [
+            (SystemTime::now() + Duration::from_secs(3600), true),
+            (SystemTime::now() + Duration::from_secs(30), false),
+            (SystemTime::now() - Duration::from_secs(3600), false),
+        ] {
+            let cached = CachedRouterTls {
+                trust_bundle_pem: ca.pem(),
+                cert_chain_pem: cert_for(&key, not_after),
+                key_pem: key.serialize_pem(),
+                // The cache entry itself has not expired; only the
+                // certificate may have.
+                expires_at: chrono::DateTime::<chrono::Utc>::from(SystemTime::now() + CACHE_TTL)
+                    .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+            };
+            let path = dir.path().join("cache.json");
+            std::fs::write(&path, serde_json::to_vec(&cached).unwrap()).unwrap();
+            assert_eq!(load_cached_from(&path).is_some(), want, "{not_after:?}");
+        }
     }
 
     #[test]
