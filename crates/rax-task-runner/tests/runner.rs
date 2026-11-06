@@ -13,7 +13,7 @@ use rax_api::v1alpha1::{
 use rax_guest::{Client, ExecOptions};
 use rax_task_runner::metadata::{Server, ServerOptions};
 use rax_task_runner::runner::{self, CommandExit, Config};
-use rax_task_runner::workspace::marker_name;
+use rax_task_runner::workspace::{INITIALIZED_MARKER_FILENAME, workspace_marker_path};
 use tokio::sync::{mpsc, oneshot};
 
 /// A blocking HTTP/1.0 GET returning the status code and body.
@@ -245,11 +245,8 @@ async fn sets_up_bound_workspace() {
     h.start().await;
     assert_eq!(h.wait_exit().await.exit_code, 0);
     assert!(code.is_dir());
-    assert!(
-        h.ax_dir
-            .join(marker_name(&code.display().to_string()))
-            .exists()
-    );
+    assert!(workspace_marker_path(&code).exists());
+    assert!(code.join(".ax").join(INITIALIZED_MARKER_FILENAME).exists());
     assert_eq!(
         std::fs::canonicalize(std::fs::read_to_string(&out).unwrap().trim()).unwrap(),
         std::fs::canonicalize(&code).unwrap()

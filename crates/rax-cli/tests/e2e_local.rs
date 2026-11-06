@@ -80,8 +80,6 @@ struct LocalRunners {
     external: Option<PathBuf>,
     rt: tokio::runtime::Handle,
     running: Mutex<HashMap<String, (String, Running)>>,
-    /// Each actor's AX state directory, for marker checks.
-    ax_dirs: Mutex<HashMap<String, PathBuf>>,
 }
 
 impl std::fmt::Debug for LocalRunners {
@@ -128,10 +126,6 @@ impl Lifecycle for LocalRunners {
             });
         }
         let ax_dir = actor_dir.join("ax");
-        self.ax_dirs
-            .lock()
-            .unwrap()
-            .insert(key.clone(), ax_dir.clone());
         let (port, metadata_port) = (free_port(), free_port());
 
         let running = match &self.external {
@@ -217,7 +211,6 @@ async fn stack() -> Stack {
         external: std::env::var_os("RAX_E2E_RUNNER").map(PathBuf::from),
         rt: tokio::runtime::Handle::current(),
         running: Mutex::default(),
-        ax_dirs: Mutex::default(),
     });
     let substrate = FakeSubstrate::new();
     substrate.state().lifecycle = Some(runners.clone());
@@ -729,7 +722,7 @@ async fn workspace_setup_files_and_git() {
             "default",
             "task-ws",
             &format!(
-                "set -e\npwd\ncat {p}/app.py\ncat {p}/overlay/config.yaml\ntest -d {p}/.agents/skills && echo SKILLS_DIR_OK\n",
+                "set -e\npwd\ncat {p}/app.py\ncat {p}/overlay/config.yaml\ntest -d {p}/.agents/skills && echo SKILLS_DIR_OK\ntest -f {p}/.git/.ax/initialized && echo MARKERS_OK\n",
                 p = primary.display()
             ),
         )
@@ -742,14 +735,9 @@ async fn workspace_setup_files_and_git() {
             "hello from git repo v1",
             "mode: git-plus-overlay",
             "SKILLS_DIR_OK",
+            "MARKERS_OK",
         ],
     );
-    // The first-run marker is named after the mount path.
-    if s.runners.external.is_none() {
-        let ax_dir = s.runners.ax_dirs.lock().unwrap()["default/task-ws"].clone();
-        let marker = rax_task_runner::workspace::marker_name(&primary.display().to_string());
-        assert!(ax_dir.join(marker).exists());
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
