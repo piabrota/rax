@@ -80,8 +80,6 @@ struct LocalRunners {
     external: Option<PathBuf>,
     rt: tokio::runtime::Handle,
     running: Mutex<HashMap<String, (String, Running)>>,
-    /// Each actor's AX state directory, for marker checks.
-    ax_dirs: Mutex<HashMap<String, PathBuf>>,
 }
 
 impl std::fmt::Debug for LocalRunners {
@@ -128,10 +126,6 @@ impl Lifecycle for LocalRunners {
             });
         }
         let ax_dir = actor_dir.join("ax");
-        self.ax_dirs
-            .lock()
-            .unwrap()
-            .insert(key.clone(), ax_dir.clone());
         let (port, metadata_port) = (free_port(), free_port());
 
         let running = match &self.external {
@@ -217,7 +211,6 @@ async fn stack() -> Stack {
         external: std::env::var_os("RAX_E2E_RUNNER").map(PathBuf::from),
         rt: tokio::runtime::Handle::current(),
         running: Mutex::default(),
-        ax_dirs: Mutex::default(),
     });
     let substrate = FakeSubstrate::new();
     substrate.state().lifecycle = Some(runners.clone());
@@ -744,11 +737,10 @@ async fn workspace_setup_files_and_git() {
             "SKILLS_DIR_OK",
         ],
     );
-    // The first-run marker is named after the mount path.
+    // The first-run marker sits in the git directory of the repository
+    // cloned into the workspace root.
     if s.runners.external.is_none() {
-        let ax_dir = s.runners.ax_dirs.lock().unwrap()["default/task-ws"].clone();
-        let marker = rax_task_runner::workspace::marker_name(&primary.display().to_string());
-        assert!(ax_dir.join(marker).exists());
+        assert!(primary.join(".git/.ax/initialized").exists());
     }
 }
 

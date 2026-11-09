@@ -160,12 +160,12 @@ refuses leaves the task `Pending`, to retry.
 ## Parity with AX
 
 **RAX covers everything AX ships**, as of AX's `main` at
-[`6e970c5`](https://github.com/google/ax/commit/6e970c5) (2026-11-03): the
+[`241bc4d`](https://github.com/google/ax/commit/241bc4d) (2026-11-05): the
 control plane (`ax-server`), the process inside each task container
 (`ax-task-runner`, including the guest services `ax ssh` talks to), the
 Claude Code runner and its image, and the CLI (`ax`, with its tunnels). The
 one AX package not ported, `internal/model`, is a Gemini client library that
-no AX binary uses. Counting AX's hand-written, non-test Go, 7,593 of 8,215
+no AX binary uses. Counting AX's hand-written, non-test Go, 7,640 of 8,262
 lines (92%) have a Rust counterpart; the rest is `internal/model`. RAX also ports
 the part of Substrate's `env` module that AX's runner embeds (`guest`, about
 1,300 lines), so no Go runs inside a RAX task.
@@ -193,7 +193,7 @@ and runner, and so on (see [What is tested](#what-is-tested)).
 | Substrate `env/guest` (embedded by AX's runner) | Guest daemon: process service with spooled output, stdin, signals, limits; filesystem service; reflection | `rax-guest` | done |
 | `cmd/ax-task-runner`, `runner` | The process inside each task container: runs setup, then supervises the task's command | `rax-task-runner` | done (same flags, `-flag` spellings too) |
 | `internal/metadata` | `/healthz`, `/readyz` and guest gRPC on one port; task and workspace YAML on loopback | `rax-task-runner::metadata` | done |
-| `internal/workspace` | Workspace setup on first run: git clones with retry, files, skills, marker files | `rax-task-runner::workspace` | done |
+| `internal/workspace` | Workspace setup on first run: git clones with retry, files, skills, a first-run marker on the workspace volume (migrating the old one under `/ax`) | `rax-task-runner::workspace` | done |
 | `cmd/runners/claude-code-runner`, `Dockerfile.claude-code` | Task runner that builds a headless `claude --print` invocation from `spec.config` and the Workspace's MCP servers; the image with Claude Code installed | `rax-claude-code-runner`, `Dockerfile.claude-code`, `examples/claude-code` | done (same arguments, byte for byte in the ported tests) |
 | `internal/model` | Gemini client built from a Model resource (API key from secret or store) | none | not ported: no AX binary uses it |
 | `Dockerfile.*`, `deploy/`, `hack/`, `test/e2e` | Images, Kubernetes manifests, kind-based end-to-end tests | `Dockerfile.server`, `Dockerfile.task-runner`, `hack/local`, `tests/e2e_local.rs` | done, reusing AX's manifests and E2E suite: RAX images and a minikube/MicroK8s setup instead of kind, and a local replay of the suite |
