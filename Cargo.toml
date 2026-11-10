@@ -61,3 +61,9 @@ tonic-reflection = "0.14"
 rax-guest = { path = "crates/rax-guest" }
 rax-task-runner = { path = "crates/rax-task-runner" }
 x509-parser = { version = "0.16", default-features = false }
+opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs", "internal-logs"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "tls-ring", "tls-webpki-roots", "trace", "metrics", "logs", "internal-logs"] }
+opentelemetry-prometheus = { version = "0.33", default-features = false }
+opentelemetry-semantic-conventions = { version = "0.33", features = ["semconv_experimental"] }
+prometheus = { version = "0.14", default-features = false, features = ["process"] }

@@ -7,11 +7,13 @@
 //! [`Reconciler`]; both are
 //! implemented on top of the Substrate client.
 
+pub mod axattr;
 pub mod controller;
 mod http;
 pub mod pods;
 mod service;
 mod tasks;
+pub mod telemetry;
 
 use async_trait::async_trait;
 use rax_api::v1alpha1::{Task, Workspace};
