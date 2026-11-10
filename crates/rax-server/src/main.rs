@@ -6,7 +6,7 @@ use std::time::Duration;
 use clap::Parser;
 use rax_server::controller::{ControllerOptions, SubstrateActors, TaskReconciler};
 use rax_server::pods::{KubeClient, PodOptions, PodRunner};
-use rax_server::{AxService, ServerOptions, router};
+use rax_server::{AxService, ServerOptions, router, telemetry};
 use rax_store::{
     Locker, MemoryLocker, MemoryStore, PostgresOptions, PostgresStore, Store, describe_url,
 };
@@ -19,6 +19,10 @@ struct Args {
     /// Listen address. Like Go, `:8080` listens on every interface.
     #[arg(long, env = "ADDR", default_value = "0.0.0.0:8080")]
     addr: String,
+
+    /// Listen address for Prometheus `/metrics`; empty disables it.
+    #[arg(long, default_value = ":9090")]
+    metrics_addr: String,
 
     /// PostgreSQL connection URL. libpq variables such as PGPASSWORD fill in
     /// what it leaves out. `memory://` keeps everything in this process, for
@@ -96,19 +100,47 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,tokio_postgres=warn".into()),
-        )
-        .init();
-    if let Err(e) = run(Args::parse()).await {
+    // JSON lines on stdout, as AX's ax-server writes them.
+    tracing::subscriber::set_global_default(telemetry::subscriber(
+        std::io::stdout,
+        "info,tokio_postgres=warn,opentelemetry=warn,opentelemetry_sdk=warn,opentelemetry_otlp=warn",
+    ))
+    .expect("installing the log subscriber");
+    let args = Args::parse();
+    let tel = match telemetry::init("rax-server") {
+        Ok(tel) => tel,
+        Err(e) => {
+            tracing::error!(error = %e, "initializing telemetry");
+            std::process::exit(1);
+        }
+    };
+    let res = run(args, &tel).await;
+    // Flushing blocks while the exporters, which run on this runtime, send.
+    let flushed = tokio::task::spawn_blocking(move || tel.shutdown(Duration::from_secs(5))).await;
+    if let Ok(Err(e)) = flushed {
+        tracing::warn!(error = %e, "flushing telemetry");
+    }
+    if let Err(e) = res {
         tracing::error!("{e}");
         std::process::exit(1);
     }
 }
 
-async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(args: Args, tel: &telemetry::Providers) -> Result<(), Box<dyn std::error::Error>> {
+    // Metrics get their own listener so the probe and API port stays as it is.
+    if !args.metrics_addr.is_empty() {
+        let listener = tokio::net::TcpListener::bind(listen_addr(&args.metrics_addr))
+            .await
+            .map_err(|e| format!("metrics server: {e}"))?;
+        tracing::info!(addr = %listener.local_addr()?, "serving metrics");
+        let router = tel.metrics_router();
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, router).await {
+                tracing::error!(error = %e, "metrics server failed");
+                std::process::exit(1);
+            }
+        });
+    }
     let (store, locker): (Arc<dyn Store>, Arc<dyn Locker>) = if args.store == "memory://" {
         tracing::warn!(
             "using the in-memory store: state is lost on exit and not shared between replicas"

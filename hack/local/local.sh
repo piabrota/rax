@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs AX on a local single-node minikube or MicroK8s cluster: Agent Substrate
-# built from source, AX's own manifests, and the control plane, task-runner and
+# from its release images (or built from source), AX's own manifests, and the control plane, task-runner and
 # CLI built from this checkout (rax) or from AX. It follows AX's kind setup
 # (hack/setup-e2e-kind.sh in AX) step by step, swapping the kind-only parts.
 # See docs/local-kubernetes.md, which also lists what does not work.
@@ -27,6 +27,7 @@
 #   SUBSTRATE_DIR        Substrate checkout, used as is (default: a clone in .tmp/local/substrate)
 #   SUBSTRATE_REPO       Substrate repository (default: https://github.com/agent-substrate/substrate.git)
 #   SUBSTRATE_REF        Substrate version for the managed clone (default: the one AX's go.mod pins)
+#   SUBSTRATE_IMAGE_REPO Registry holding Substrate release images (default: ghcr.io/agent-substrate/substrate)
 #   FORCE_INSTALL_SUBSTRATE  true to reinstall Substrate even if that commit is installed
 #   AX_WORKER_REPLICAS   gVisor workers in the ax-workers WorkerPool (default: 2)
 #   RESET_DB             true to wipe AX's Postgres volume before deploying
@@ -59,6 +60,7 @@ MINIKUBE_DRIVER="${MINIKUBE_DRIVER:-docker}"
 MICROK8S_CHANNEL="${MICROK8S_CHANNEL:-1.37/stable}"
 INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
 SUBSTRATE_REPO="${SUBSTRATE_REPO:-https://github.com/agent-substrate/substrate.git}"
+SUBSTRATE_IMAGE_REPO="${SUBSTRATE_IMAGE_REPO:-ghcr.io/agent-substrate/substrate}"
 AX_REPO="${AX_REPO:-https://github.com/google/ax.git}"
 AX_REF="${AX_REF:-main}"
 # AX's ax-server manifest and Substrate's bootstrap owners both assume this.
@@ -351,6 +353,82 @@ resolve_substrate_dir() {
     die "${SUBSTRATE_DIR} has neither hack/install-ate-kind.sh nor cmd/ate-setup; use a Substrate version AX supports"
   SUBSTRATE_COMMIT="$(git -C "${SUBSTRATE_DIR}" rev-parse HEAD)"
   log "Using Substrate at ${SUBSTRATE_DIR} (${SUBSTRATE_COMMIT:0:12})"
+  resolve_substrate_release
+}
+
+# The ko:// worker image in AX's WorkerPool, and the name Substrate publishes
+# it under (the last element of the import path).
+worker_ko_ref() {
+  awk '$1 == "workerImage:" { print $2; exit }' "${AX_DIR}/test/e2e/manifests/workerpool.yaml"
+}
+
+# Every Substrate image the kind install and the WorkerPool use.
+substrate_images() {
+  local worker
+  worker="$(worker_ko_ref)"
+  printf '%s\n' ateapi atecontroller atelet atenet "${worker##*/}" podcertcontroller objectstore-plugin envoy-dataplane
+}
+
+# image_digest prints the digest the registry holds for repo:tag, where repo
+# is host/path, or fails if it has none. A registry that answers 401 gets an
+# anonymous pull token, which is enough for public images such as
+# Substrate's releases on ghcr.io. As in AX's kind setup.
+image_digest() {
+  local tag="$2" host="${1%%/*}" path="${1#*/}" url headers challenge realm service token
+  url="https://${host}/v2/${path}/manifests/${tag}"
+  local accept=(
+    -H 'Accept: application/vnd.oci.image.index.v1+json'
+    -H 'Accept: application/vnd.oci.image.manifest.v1+json'
+    -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json'
+    -H 'Accept: application/vnd.docker.distribution.manifest.v2+json'
+  )
+  headers="$(curl -sSI "${accept[@]}" "${url}" 2> /dev/null | tr -d '\r')" || return 1
+  # The last status line, past any proxy's CONNECT response.
+  if [[ "$(awk '/^HTTP\// { code = $2 } END { print code }' <<< "${headers}")" == "401" ]]; then
+    challenge="$(awk 'tolower($1) == "www-authenticate:"' <<< "${headers}")"
+    realm="$(sed -nE 's/.*realm="([^"]+)".*/\1/p' <<< "${challenge}")"
+    service="$(sed -nE 's/.*service="([^"]+)".*/\1/p' <<< "${challenge}")"
+    [[ -n "${realm}" ]] || return 1
+    token="$(curl -fsS -G "${realm}" --data-urlencode "service=${service}" \
+      --data-urlencode "scope=repository:${path}:pull" 2> /dev/null |
+      sed -nE 's/.*"(access_)?token" *: *"([^"]+)".*/\2/p')"
+    [[ -n "${token}" ]] || return 1
+    headers="$(curl -fsSI "${accept[@]}" -H "Authorization: Bearer ${token}" "${url}" 2> /dev/null | tr -d '\r')" || return 1
+  fi
+  awk 'tolower($1) == "docker-content-digest:" { print $2; found = 1 } END { exit !found }' <<< "${headers}"
+}
+
+# resolve_substrate_release sets SUBSTRATE_RELEASE to the release tag whose
+# published images to install, as AX's kind setup now does, or leaves it
+# empty to build Substrate from source with ko. Release images need a clean
+# checkout at a release tag (the manifests come from the checkout, the images
+# from the release), an ate-setup with --image-repo, and every image published
+# under SUBSTRATE_IMAGE_REPO. AX's setup refuses anything else; this one
+# builds instead, so a Substrate checkout with local changes still deploys.
+resolve_substrate_release() {
+  SUBSTRATE_RELEASE=""
+  local tag img
+  tag="$(git -C "${SUBSTRATE_DIR}" tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$' | head -n1 || true)"
+  if [[ -z "${tag}" ]]; then
+    log "Substrate ${SUBSTRATE_COMMIT:0:12} is not a release tag; building it from source."
+    return
+  fi
+  if [[ -n "$(git -C "${SUBSTRATE_DIR}" status --porcelain --untracked-files=no)" ]]; then
+    log "Substrate checkout has local changes; building it from source instead of using the ${tag} release images."
+    return
+  fi
+  if ! grep -q -- "--image-repo" "${SUBSTRATE_DIR}/cmd/ate-setup/commands.md" 2> /dev/null; then
+    log "Substrate ${tag} cannot install pre-built images (ate-setup has no --image-repo); building it from source."
+    return
+  fi
+  while read -r img; do
+    if ! image_digest "${SUBSTRATE_IMAGE_REPO}/${img}" "${tag}" > /dev/null; then
+      log "${SUBSTRATE_IMAGE_REPO}/${img}:${tag} not found; building Substrate from source."
+      return
+    fi
+  done < <(substrate_images)
+  SUBSTRATE_RELEASE="${tag}"
+  log "Using Substrate ${tag} release images from ${SUBSTRATE_IMAGE_REPO}."
 }
 
 # render substitutes only the AX_* variables in one of AX's E2E manifests.
@@ -429,6 +507,22 @@ deploy_substrate() {
     k apply -f "${SCRIPT_DIR}/registry.yaml" > /dev/null
   fi
 
+  if [[ -n "${SUBSTRATE_RELEASE}" ]]; then
+    log "Installing Substrate ${SUBSTRATE_RELEASE} from its release images..."
+    (
+      cd "${SUBSTRATE_DIR}"
+      ATE_IMAGE_REPO="${SUBSTRATE_IMAGE_REPO}" ATE_IMAGE_TAG="${SUBSTRATE_RELEASE}" \
+        go run ./cmd/ate-setup --kind --context="${KUBE_CONTEXT}" \
+        deploy ate-system \
+        --rollout-timeout="${SUBSTRATE_ROLLOUT_TIMEOUT:-5m}" \
+        --credential-provider='{"enabled":false}' \
+        --ateapi-authz-bootstrap-owners="system:serviceaccount:ate-system:ate-client,system:serviceaccount:${AX_SYSTEM_NAMESPACE}:ax-server" \
+        --ingress-allowed-spiffe-ids="spiffe://cluster.local/ns/${AX_SYSTEM_NAMESPACE}/sa/ax-server"
+    )
+    k annotate namespace ate-system "substrate-commit=${SUBSTRATE_COMMIT}" --overwrite > /dev/null
+    return
+  fi
+
   log "Building and installing Substrate ${SUBSTRATE_COMMIT:0:12} (this takes a while the first time)..."
   # Substrate's kind profile fits a single local node: in-cluster Postgres,
   # RustFS for snapshots, no cloud credential provider. Its only kind-specific
@@ -456,11 +550,19 @@ deploy_substrate() {
 deploy_workers() {
   log "Deploying namespace ${AX_SYSTEM_NAMESPACE} and the ax-workers WorkerPool (${AX_WORKER_REPLICAS} gVisor replicas)..."
   render namespace.yaml | k apply -f -
-  (
-    cd "${SUBSTRATE_DIR}"
-    render workerpool.yaml |
-      KO_DOCKER_REPO="${REGISTRY_ADDR}" ./hack/run-tool.sh ko resolve --platform="linux/${NODE_ARCH}" -f -
-  ) | k apply -f -
+  if [[ -n "${SUBSTRATE_RELEASE}" ]]; then
+    # The release's worker image, pinned by digest as Substrate requires.
+    local ko_ref worker_ref
+    ko_ref="$(worker_ko_ref)"
+    worker_ref="${SUBSTRATE_IMAGE_REPO}/${ko_ref##*/}:${SUBSTRATE_RELEASE}@$(image_digest "${SUBSTRATE_IMAGE_REPO}/${ko_ref##*/}" "${SUBSTRATE_RELEASE}")"
+    render workerpool.yaml | sed "s|${ko_ref}|${worker_ref}|" | k apply -f -
+  else
+    (
+      cd "${SUBSTRATE_DIR}"
+      render workerpool.yaml |
+        KO_DOCKER_REPO="${REGISTRY_ADDR}" ./hack/run-tool.sh ko resolve --platform="linux/${NODE_ARCH}" -f -
+    ) | k apply -f -
+  fi
   local _
   for _ in $(seq 1 60); do
     k -n "${AX_SYSTEM_NAMESPACE}" get deployment ax-workers > /dev/null 2>&1 && break
