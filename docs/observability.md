@@ -48,7 +48,7 @@ keeps the default below, as AX does.
 
 | Variable | Effect |
 |---|---|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector address, for example `http://otel-collector.observability.svc:4317`. The SDK default is `http://localhost:4317`. An `http://` endpoint is reached without TLS; `https://` uses the Mozilla roots. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector address, for example `http://otel-collector.observability.svc:4317`. The SDK default is `http://localhost:4317`. The endpoint must be `http://`, reached without TLS: rax-server does not export over TLS yet. |
 | `OTEL_TRACES_EXPORTER` | `otlp` (default) or `none`. With `none`, traces are still sampled and propagated, only not sent. |
 | `OTEL_METRICS_EXPORTER` | Controls only the OTLP push: `otlp` (default) turns it on; `prometheus` or `none` turns it off. `/metrics` is controlled by `--metrics-addr`. |
 | `OTEL_LOGS_EXPORTER` | Where events go: `none` (default) writes them to stdout; `otlp` sends them to the collector instead; `otlp,console` does both. |
