@@ -722,7 +722,7 @@ async fn workspace_setup_files_and_git() {
             "default",
             "task-ws",
             &format!(
-                "set -e\npwd\ncat {p}/app.py\ncat {p}/overlay/config.yaml\ntest -d {p}/.agents/skills && echo SKILLS_DIR_OK\n",
+                "set -e\npwd\ncat {p}/app.py\ncat {p}/overlay/config.yaml\ntest -d {p}/.agents/skills && echo SKILLS_DIR_OK\ntest -f {p}/.git/.ax/initialized && echo MARKERS_OK\n",
                 p = primary.display()
             ),
         )
@@ -735,13 +735,9 @@ async fn workspace_setup_files_and_git() {
             "hello from git repo v1",
             "mode: git-plus-overlay",
             "SKILLS_DIR_OK",
+            "MARKERS_OK",
         ],
     );
-    // The first-run marker sits in the git directory of the repository
-    // cloned into the workspace root.
-    if s.runners.external.is_none() {
-        assert!(primary.join(".git/.ax/initialized").exists());
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
