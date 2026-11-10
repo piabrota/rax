@@ -7,12 +7,12 @@ mod validate;
 mod yaml;
 
 pub mod v1alpha1 {
-    //! Types and service generated from `proto/ax/v1alpha1/ax.proto`.
+    //! Types and service generated from AX's protos in `proto/pkg/apis/v1alpha1`.
     #![allow(clippy::all)]
     tonic::include_proto!("ax.v1alpha1");
     include!(concat!(env!("OUT_DIR"), "/ax.v1alpha1.serde.rs"));
 
-    /// Encoded `FileDescriptorSet` for ax.proto and its imports.
+    /// Encoded `FileDescriptorSet` for AX's protos and their imports.
     pub const FILE_DESCRIPTOR_SET: &[u8] =
         include_bytes!(concat!(env!("OUT_DIR"), "/ax_descriptor.bin"));
 }
