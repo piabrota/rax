@@ -4,14 +4,15 @@ AX's own development cluster is [kind](https://kind.sigs.k8s.io/), set up by
 `hack/setup-e2e-kind.sh` in AX. This repository adds the same setup for two
 other light distributions, [minikube](https://minikube.sigs.k8s.io/) and
 [MicroK8s](https://microk8s.io/), driven by [`just`](https://just.systems/)
-recipes. Everything that runs in the cluster is built from source: Agent
-Substrate, the task-runner and the control plane. By default the task-runner,
+recipes. Agent Substrate is installed from its published release images, as
+AX's kind setup now does; the task-runner and the control plane are built
+from source. By default the task-runner,
 the control plane and the CLI are RAX's, from this checkout; `RUNNER=ax`,
 `SERVER=ax` and `CLI=ax` swap in AX's Go `ax-task-runner`, `ax-server` and
 `ax`, one at a time or together.
 
 > **Status: not yet run end to end.** The scripts were written against AX's
-> kind setup and Substrate's installer (v0.6.0's, then v1.0.0-rc.1's
+> kind setup and Substrate's installer (v0.6.0's, then v1.0's
 > `ate-setup`) and are statically checked
 > (shellcheck, `just --dry-run`), but no cluster has been brought up with
 > them yet: the environment they were written in cannot give a nested
@@ -44,8 +45,11 @@ just minikube
 just microk8s
 ```
 
-The first `deploy` builds Substrate's images from source and takes a while.
-Later runs skip Substrate unless its version changes.
+The first `deploy` installs Substrate from its release images in
+`ghcr.io/agent-substrate/substrate`. A Substrate checkout that is not a clean
+release tag, or a release without published images, is built from source
+instead, which takes a while. Later runs skip Substrate unless its version
+changes.
 
 Then use the CLI (`rax` unless `CLI=ax`) against the cluster:
 
@@ -77,6 +81,7 @@ Substrate, the WorkerPool and the Postgres data are kept.
 | `AX_DIR` | `../ax`, else `.tmp/local/ax` | AX checkout for manifests and the e2e suite (and the Go binaries when one of the above is `ax`) |
 | `SUBSTRATE_DIR` | `.tmp/local/substrate` | Use your own Substrate checkout, as is |
 | `SUBSTRATE_REF` | the version AX's `go.mod` pins | Substrate version for the managed clone |
+| `SUBSTRATE_IMAGE_REPO` | `ghcr.io/agent-substrate/substrate` | Registry holding Substrate's release images, for a mirror |
 | `FORCE_INSTALL_SUBSTRATE` | `false` | Reinstall Substrate even if that commit is installed |
 | `AX_WORKER_REPLICAS` | `2` | gVisor workers in the `ax-workers` WorkerPool (kind uses 4) |
 | `K8S_VERSION` | `v1.37.0` | Kubernetes version for minikube and the installed kubectl |
@@ -123,15 +128,18 @@ manifests from `test/e2e/manifests` unchanged:
    the port (`--ports=127.0.0.1:5001:5001`). A `kind-registry` Service in
    `ate-system` stands in for kind's registry container, which Substrate's
    atelet pulls task images from.
-2. **Substrate.** Substrate's `ate-setup --kind deploy ate-system` (or
-   `hack/install-ate-kind.sh` on versions before 1.0) with AX's flags,
-   pointed at this cluster's context. Substrate's kind
+2. **Substrate.** Substrate's `ate-setup --kind deploy ate-system` with AX's
+   flags, pointed at this cluster's context. For a clean checkout of a release
+   tag whose images are published, it installs those images
+   (`ATE_IMAGE_REPO`, `ATE_IMAGE_TAG`), as AX's kind setup now does;
+   otherwise it builds them with `ko` into the local registry (or runs
+   `hack/install-ate-kind.sh` on versions before 1.0). Substrate's kind
    profile fits any single local node: in-cluster Postgres, RustFS for
    snapshots, and no cloud credential provider. The installed commit is
    recorded on the `ate-system` namespace, and a different one is uninstalled
    first.
 3. **WorkerPool.** AX's `namespace.yaml` and `workerpool.yaml`, with the gVisor
-   worker image built by `ko`.
+   worker image of the release pinned by digest, or built by `ko`.
 4. **Images.** The task-runner (RAX's `Dockerfile.task-runner` or AX's, then
    AX's E2E variant on top) and the server, pushed and deployed by digest,
    since Substrate only runs digest-pinned images. The CLI (`rax` or AX's
@@ -160,8 +168,8 @@ Rust. What is still Go:
 - **AX's manifests and E2E suite** (`test/e2e`), which is why an AX checkout
   is required. The suite drives whatever CLI `AX_BIN` names, the `rax` binary
   by default.
-- **Substrate**, built from source on every version change, which needs Go
-  and Docker on the host.
+- **Substrate**, installed from its release images by its Go installer, which
+  needs Go on the host (and Docker when it is built from source).
 
 ### RAX against AX's suite on a cluster has not been run
 
@@ -185,7 +193,7 @@ Use `SERVER=ax`, `RUNNER=ax` or `CLI=ax` to tell a RAX bug from a setup problem.
   them either. Kubernetes 1.34 or newer is needed; v1.37.0 is the default.
 - **A Substrate version AX's kind setup supports.** Substrate v1.0 installs
   with `go run ./cmd/ate-setup --kind`, which AX's `hack/setup-e2e-kind.sh`
-  now uses and so does `deploy` (v1.0.0-rc.1 is the version AX pins at the
+  now uses and so does `deploy` (v1.0.0 is the version AX pins at the
   time of writing); older versions with `hack/install-ate-kind.sh` still
   work. Either way Go is needed on the host to run the installer.
 - **Docker on the host**, even for MicroK8s: the images are built with it,
