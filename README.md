@@ -166,7 +166,7 @@ control plane (`ax-server`), the process inside each task container
 (`ax-task-runner`, including the guest services `ax ssh` talks to), the
 Claude Code runner and its image, and the CLI (`ax`, with its tunnels). The
 one AX package not ported, `internal/model`, is a Gemini client library that
-no AX binary uses. Counting AX's hand-written, non-test Go, 7,593 of 8,215
+no AX binary uses. Counting AX's hand-written, non-test Go, 7,640 of 8,262
 lines (92%) have a Rust counterpart; the rest is `internal/model`. RAX also ports
 the part of Substrate's `env` module that AX's runner embeds (`guest`, about
 1,300 lines), so no Go runs inside a RAX task.
@@ -228,7 +228,7 @@ and runner, and so on (see [What is tested](#what-is-tested)).
 
 ### What is tested
 
-176 tests, all run in CI (`cargo test --all`, with a PostgreSQL 16 service).
+177 tests, all run in CI (`cargo test --all`, with a PostgreSQL 16 service).
 They port the Go tests for the packages above and add some of their own.
 
 | Suite | Tests | Covers |
@@ -242,7 +242,7 @@ They port the Go tests for the packages above and add some of their own.
 | `rax-substrate` `tests/client.rs` | 13 | Client against an in-memory Substrate: atespace, template and actor creation, revert or recreate of crashed actors, waiting out deleting actors, resume retries (`ResourceExhausted` not retried), delete polling, missing actors and timeout, template deletion retries, pagination, token re-read on every call |
 | `rax-substrate` `tests/tls.rs` | 1 | A real TLS connection: CA file, authority override, wrong server name rejected, unreadable CA, skip-verify |
 | `rax-guest` unit | 9 | Output spooling and replay from offsets, exit codes and signal exits (128+n), stdin writes and close, signals to the process group, the concurrency cap, log truncation, the default timeout, pruning, start failures, timeouts, path cleaning and confinement, the signal table |
-| `rax-task-runner` unit | 12 | First-run marker on the workspace volume, the marker inside `.git` after a clone into the root, legacy markers migrated only for their own workspace, a linked marker directory refused, git clone into a subdirectory with depth, git errors withholding the marker, inlined files, marker names, clone destinations, spec loading with unknown fields and empty specs |
+| `rax-task-runner` unit | 13 | First-run marker on the workspace volume, the marker inside `.git` after a clone into the root, legacy markers migrated only for their own workspace, a linked marker directory refused, git clone into a subdirectory with depth, git errors withholding the marker, inlined files, marker names, clone destinations, spec loading with unknown fields and empty specs |
 | `rax-task-runner` `tests/runner.rs` | 8 | Ports of AX's runner, metadata and guest client tests: command env, working directory and exit code, serving after the command exits, stopping the command's process group, waiting without a command, bound workspace setup and readiness, metadata only on loopback, guest services only with `spec.debug`, exec with stdin, empty stdin, exit codes and forwarded signals |
 | `rax-claude-code-runner` unit | 7 | Ports of AX's claude-code-runner tests: rejected configs, the minimal invocation, flags by value type in sorted order, the Workspace's MCP servers as `--mcp-config` byte for byte, Go-style JSON escaping and numbers, `spec.command` left alone |
 | `rax-cli` unit | 20 | Ports of AX's argument parsing (with `-n` over `$AX_SYSTEM_NAMESPACE`), `ssh` argument and Ctrl-C escalation tests, tunnel context names and the port-forward pattern, AX's tunnel state files, tabwriter-style tables, Go `%v` values, document splitting, kinds, worker addresses, router TLS configs, router certificate expiry in the cache |

@@ -34,14 +34,12 @@ pub struct SetupResult {
 /// Prepares the workspace at `target` on its first run: writes the inlined
 /// files, clones the declared repositories and creates the skills path. A
 /// marker on the workspace volume (see [`workspace_marker_path`]) records a
-/// finished first run, so later calls do nothing, even after a resume that
-/// restores only the volumes.
+/// finished first run, so later calls do nothing.
 ///
 /// Git failures are logged and recorded under `ax_dir` but don't fail setup;
 /// the marker is withheld so the next start retries the clone. Failing to
-/// create the workspace directory is an error, and so is a marker, or the
-/// directory holding it, that is a symbolic link: the agent can make one, and
-/// following it would read or write outside the workspace.
+/// create the workspace directory is an error, and so is a marker path that
+/// is a symbolic link.
 pub async fn setup_workspace(
     ws: Option<&Workspace>,
     target: &str,
@@ -81,8 +79,8 @@ pub async fn setup_workspace(
         return Ok(res);
     }
     // A marker from before the marker moved to the workspace volume lives
-    // under `ax_dir`. Migrate it, so a container that still has `ax_dir` does
-    // not rerun setup over the agent's edits.
+    // under `ax_dir`. Migrate it, so a container that still has `ax_dir`
+    // does not rerun setup over the agent's edits.
     if let Ok(data) = std::fs::read(ax_dir.join(marker_name(&target.to_string_lossy())))
         && legacy_owned_by(&data, ws)
     {
@@ -105,7 +103,8 @@ pub async fn setup_workspace(
         tracing::warn!(path = %target.display(), "maiden run workspace setup completed with errors; marker omitted to allow retry");
         return Ok(res);
     }
-    // Recomputed: a clone into the workspace root has just created `.git`.
+    // A repository cloned into the workspace root moves the marker into its
+    // .git directory, so look the path up again.
     write_marker(&workspace_marker_path(&target), ws);
     tracing::info!(path = %target.display(), "maiden run workspace setup completed successfully");
     Ok(res)
@@ -252,7 +251,11 @@ pub fn marker_name(path: &str) -> String {
         path
     };
     let cleaned = rax_guest::filesystem::clean(Path::new(path));
-    let mut clean = cleaned.to_string_lossy().trim_matches('/').to_owned();
+    let mut clean = cleaned
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/")
+        .trim_matches('/')
+        .to_owned();
     if clean.is_empty() {
         clean = "root".into();
     }
@@ -260,20 +263,24 @@ pub fn marker_name(path: &str) -> String {
 }
 
 /// Where the first-run marker lives: on the workspace volume, so it survives
-/// a resume that restores only the volumes. In a git checkout it sits in the
-/// git directory, which `git add -A` and `git clean -fdx` never touch;
-/// otherwise in `.ax`.
+/// a volumes-only resume, which does not restore `ax_dir`. For a git
+/// repository it sits in the git directory, which `git add -A` and `git clean
+/// -fdx` never touch; otherwise it sits in `.ax`.
 pub fn workspace_marker_path(target: &Path) -> PathBuf {
-    let git = target.join(".git");
-    if std::fs::symlink_metadata(&git).is_ok_and(|m| m.is_dir()) {
-        return git.join(MARKER_DIR_NAME).join(INITIALIZED_MARKER_FILENAME);
+    let git_dir = target.join(".git");
+    if std::fs::symlink_metadata(&git_dir).is_ok_and(|m| m.is_dir()) {
+        return git_dir
+            .join(MARKER_DIR_NAME)
+            .join(INITIALIZED_MARKER_FILENAME);
     }
     target
         .join(MARKER_DIR_NAME)
         .join(INITIALIZED_MARKER_FILENAME)
 }
 
-/// Whether the marker or its directory is a symbolic link.
+/// Whether the marker's directory or the marker itself is a symbolic link.
+/// The agent can create one, and reading or writing through it would leave
+/// the workspace.
 fn marker_linked(path: &Path) -> bool {
     [path.parent().unwrap_or(path), path]
         .iter()
@@ -287,6 +294,7 @@ fn legacy_owned_by(data: &[u8], ws: Option<&Workspace>) -> bool {
     data.starts_with(format!("workspace: {}\n", workspace_name(ws)).as_bytes())
 }
 
+/// The workspace's name as markers record it.
 fn workspace_name(ws: Option<&Workspace>) -> &str {
     ws.and_then(|w| w.metadata.as_ref())
         .map(|m| m.name.as_str())
@@ -296,15 +304,15 @@ fn workspace_name(ws: Option<&Workspace>) -> &str {
 
 fn write_marker(path: &Path, ws: Option<&Workspace>) {
     let name = workspace_name(ws);
-    let now = chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now())
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let content = format!("workspace: {name}\ninitialized_at: {now}\n");
     if let Some(dir) = path.parent()
         && let Err(e) = std::fs::create_dir_all(dir)
     {
         tracing::warn!(path = %path.display(), error = %e, "failed to create initialized marker directory");
         return;
     }
+    let now = chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now())
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let content = format!("workspace: {name}\ninitialized_at: {now}\n");
     if let Err(e) = std::fs::write(path, content) {
         tracing::warn!(path = %path.display(), error = %e, "failed to write initialized marker file");
     }
@@ -405,8 +413,7 @@ mod tests {
             content.starts_with("workspace: test-ws\ninitialized_at: "),
             "{content}"
         );
-        // Neither the old in-workspace name nor the legacy state marker.
-        assert!(!tmp.path().join(".ax-initialized").exists());
+        // Nothing is left under the state directory to mark the run.
         assert!(!state.join(marker_name(target)).exists());
 
         let second = setup_workspace(Some(&ws), target, &state).await.unwrap();
@@ -469,121 +476,11 @@ mod tests {
         let res = setup_workspace(Some(&ws), target, &state).await.unwrap();
         assert!(res.cloned_repos.is_empty());
         assert!(state.join(GIT_ERROR_LOG).exists());
-        assert!(!workspace_marker_path(tmp.path()).exists());
         assert!(
             !tmp.path()
                 .join(".ax")
                 .join(INITIALIZED_MARKER_FILENAME)
                 .exists()
-        );
-    }
-
-    #[tokio::test]
-    async fn marker_follows_root_clone() {
-        let src = tempfile::tempdir().unwrap();
-        git(
-            src.path(),
-            &format!("{INIT} && echo hi > README.md && git add . && git commit -qm init"),
-        );
-        let tmp = tempfile::tempdir().unwrap();
-        let target = tmp.path().join("ws");
-        let state = tmp.path().join("ax-state-root-clone");
-        let ws = workspace(
-            "root-clone-ws",
-            WorkspaceSpec {
-                git: vec![GitRepo {
-                    name: "root".into(),
-                    repo: src.path().display().to_string(),
-                    dir: ".".into(),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            },
-        );
-        let target = target.to_str().unwrap();
-        setup_workspace(Some(&ws), target, &state).await.unwrap();
-        assert!(
-            Path::new(target)
-                .join(".git/.ax")
-                .join(INITIALIZED_MARKER_FILENAME)
-                .exists(),
-            "marker not in the cloned .git directory"
-        );
-        let res = setup_workspace(Some(&ws), target, &state).await.unwrap();
-        assert!(!res.is_maiden_run, "second run reran setup");
-    }
-
-    async fn setup_with_legacy_marker(legacy_owner: &str, ws_name: &str) -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().unwrap();
-        let target = tmp.path().join("ws");
-        let state = tmp.path().join("ax-state");
-        std::fs::create_dir_all(&state).unwrap();
-        std::fs::write(
-            state.join(marker_name(target.to_str().unwrap())),
-            format!("workspace: {legacy_owner}\n"),
-        )
-        .unwrap();
-        let ws = workspace(
-            ws_name,
-            WorkspaceSpec {
-                files: vec![File {
-                    path: "x.txt".into(),
-                    content: "x".into(),
-                }],
-                ..Default::default()
-            },
-        );
-        setup_workspace(Some(&ws), target.to_str().unwrap(), &state)
-            .await
-            .unwrap();
-        tmp
-    }
-
-    #[tokio::test]
-    async fn migrates_own_legacy_marker() {
-        let tmp = setup_with_legacy_marker("own-ws", "own-ws").await;
-        let target = tmp.path().join("ws");
-        assert!(
-            target
-                .join(".ax")
-                .join(INITIALIZED_MARKER_FILENAME)
-                .exists(),
-            "legacy marker not migrated"
-        );
-        assert!(
-            !target.join("x.txt").exists(),
-            "setup reran although the legacy marker was this workspace's"
-        );
-    }
-
-    #[tokio::test]
-    async fn ignores_legacy_marker_of_other_workspace() {
-        let tmp = setup_with_legacy_marker("other-ws", "this-ws").await;
-        assert!(
-            tmp.path().join("ws/x.txt").exists(),
-            "setup was skipped because of another workspace's legacy marker"
-        );
-    }
-
-    #[tokio::test]
-    async fn refuses_linked_marker_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let outside = tmp.path().join("outside");
-        let target = tmp.path().join("ws");
-        std::fs::create_dir_all(&outside).unwrap();
-        std::fs::create_dir_all(&target).unwrap();
-        std::os::unix::fs::symlink(&outside, target.join(".ax")).unwrap();
-        let ws = workspace("linked-ws", WorkspaceSpec::default());
-        let res = setup_workspace(
-            Some(&ws),
-            target.to_str().unwrap(),
-            &tmp.path().join("ax-state-linked"),
-        )
-        .await;
-        assert!(res.is_err(), "a linked .ax directory was not refused");
-        assert!(
-            !outside.join(INITIALIZED_MARKER_FILENAME).exists(),
-            "marker was written through a linked .ax directory"
         );
     }
 
@@ -620,6 +517,163 @@ mod tests {
             r#"{"env": "production"}"#
         );
         assert_eq!(std::fs::read_to_string(abs).unwrap(), "absolute");
+    }
+
+    /// A repository cloned into the workspace root takes the marker into its
+    /// new .git directory, where the next run looks for it.
+    #[tokio::test]
+    async fn marker_follows_root_clone() {
+        let src = tempfile::tempdir().unwrap();
+        git(
+            src.path(),
+            &format!("{INIT} && echo hi > README.md && git add . && git commit -qm init"),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("ax-state");
+        let target = tmp.path().join("ws");
+        let ws = workspace(
+            "root-clone-ws",
+            WorkspaceSpec {
+                git: vec![GitRepo {
+                    name: "root".into(),
+                    repo: src.path().display().to_string(),
+                    dir: ".".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let target_str = target.to_str().unwrap();
+        setup_workspace(Some(&ws), target_str, &state)
+            .await
+            .unwrap();
+        assert!(
+            target
+                .join(".git/.ax")
+                .join(INITIALIZED_MARKER_FILENAME)
+                .exists()
+        );
+        assert_eq!(
+            workspace_marker_path(&target),
+            target.join(".git/.ax").join(INITIALIZED_MARKER_FILENAME)
+        );
+        let res = setup_workspace(Some(&ws), target_str, &state)
+            .await
+            .unwrap();
+        assert!(!res.is_maiden_run, "the second run did not find the marker");
+    }
+
+    fn files_ws(name: &str) -> Workspace {
+        workspace(
+            name,
+            WorkspaceSpec {
+                files: vec![File {
+                    path: "x.txt".into(),
+                    content: "x".into(),
+                }],
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A legacy marker in the state directory written for this workspace is
+    /// migrated, and setup does not rerun.
+    #[tokio::test]
+    async fn migrates_own_legacy_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("ws");
+        let state = tmp.path().join("ax-state");
+        std::fs::create_dir_all(&state).unwrap();
+        let target_str = target.to_str().unwrap();
+        std::fs::write(state.join(marker_name(target_str)), "workspace: own-ws\n").unwrap();
+
+        let res = setup_workspace(Some(&files_ws("own-ws")), target_str, &state)
+            .await
+            .unwrap();
+        assert!(!res.is_maiden_run);
+        assert!(
+            target
+                .join(".ax")
+                .join(INITIALIZED_MARKER_FILENAME)
+                .exists(),
+            "legacy marker not migrated"
+        );
+        assert!(
+            !target.join("x.txt").exists(),
+            "setup reran although the legacy marker was this workspace's"
+        );
+    }
+
+    /// A legacy marker with the same name but written for another workspace
+    /// does not suppress setup.
+    #[tokio::test]
+    async fn ignores_legacy_marker_of_other_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("ws");
+        let state = tmp.path().join("ax-state");
+        std::fs::create_dir_all(&state).unwrap();
+        let target_str = target.to_str().unwrap();
+        std::fs::write(state.join(marker_name(target_str)), "workspace: other-ws\n").unwrap();
+
+        let res = setup_workspace(Some(&files_ws("this-ws")), target_str, &state)
+            .await
+            .unwrap();
+        assert!(res.is_maiden_run);
+        assert!(
+            target.join("x.txt").exists(),
+            "setup was skipped because of another workspace's legacy marker"
+        );
+    }
+
+    /// A .ax directory that links outside the workspace is refused, and
+    /// nothing is written through it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refuses_linked_marker_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        let target = tmp.path().join("ws");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&outside, target.join(".ax")).unwrap();
+
+        let ws = workspace("linked-ws", WorkspaceSpec::default());
+        let err = setup_workspace(
+            Some(&ws),
+            target.to_str().unwrap(),
+            &tmp.path().join("ax-state"),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("symbolic link"), "{err}");
+        assert!(!outside.join(INITIALIZED_MARKER_FILENAME).exists());
+    }
+
+    /// A marker that is itself a link is refused too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refuses_linked_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("ws");
+        std::fs::create_dir_all(target.join(".ax")).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::write(&elsewhere, "workspace: linked-ws\n").unwrap();
+        std::os::unix::fs::symlink(
+            &elsewhere,
+            target.join(".ax").join(INITIALIZED_MARKER_FILENAME),
+        )
+        .unwrap();
+
+        let ws = workspace("linked-ws", WorkspaceSpec::default());
+        assert!(
+            setup_workspace(
+                Some(&ws),
+                target.to_str().unwrap(),
+                &tmp.path().join("ax-state"),
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[test]

@@ -246,7 +246,10 @@ async fn sets_up_bound_workspace() {
     assert_eq!(h.wait_exit().await.exit_code, 0);
     assert!(code.is_dir());
     assert!(workspace_marker_path(&code).exists());
-    assert!(code.join(".ax").join(INITIALIZED_MARKER_FILENAME).exists());
+    assert_eq!(
+        workspace_marker_path(&code),
+        code.join(".ax").join(INITIALIZED_MARKER_FILENAME)
+    );
     assert_eq!(
         std::fs::canonicalize(std::fs::read_to_string(&out).unwrap().trim()).unwrap(),
         std::fs::canonicalize(&code).unwrap()
