@@ -1,0 +1,49 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package ax.v1alpha1;
+
+import "pkg/apis/v1alpha1/model.proto";
+import "pkg/apis/v1alpha1/task.proto";
+import "pkg/apis/v1alpha1/workspace.proto";
+
+option go_package = "github.com/google/ax/pkg/apis/v1alpha1";
+
+// AX defines the core control plane gRPC service for autonomous agent orchestration.
+service AX {
+  // Manifests are parsed by the client (see `ax apply`) and submitted through the
+  // typed Update* RPCs below; the server never receives raw YAML.
+
+  // Tasks
+  rpc GetTask(GetTaskRequest) returns (Task);
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+  rpc CreateTask(CreateTaskRequest) returns (Task);
+  rpc DeleteTask(DeleteTaskRequest) returns (DeleteTaskResponse);
+  rpc SuspendTask(SuspendTaskRequest) returns (Task);
+  rpc ResumeTask(ResumeTaskRequest) returns (Task);
+
+  // Workspaces
+  rpc GetWorkspace(GetWorkspaceRequest) returns (Workspace);
+  rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
+  rpc UpdateWorkspace(UpdateWorkspaceRequest) returns (Workspace);
+  rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse);
+
+  // Models
+  rpc GetModel(GetModelRequest) returns (Model);
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+  rpc UpdateModel(UpdateModelRequest) returns (Model);
+  rpc DeleteModel(DeleteModelRequest) returns (DeleteModelResponse);
+}

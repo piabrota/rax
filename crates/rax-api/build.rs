@@ -1,4 +1,6 @@
-//! Generates the AX v1alpha1 types and gRPC service from proto/ax/v1alpha1/ax.proto.
+//! Generates the AX v1alpha1 types and gRPC service from AX's protos, copied
+//! unchanged to proto/pkg/apis/v1alpha1: ax.proto holds the service and
+//! imports the per-resource files (common, task, workspace and model.proto).
 //!
 //! protox compiles the proto in pure Rust, so no protoc is needed. prost and
 //! tonic generate the messages and service; pbjson generates serde impls that
@@ -9,8 +11,10 @@ use std::{env, path::PathBuf};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../proto");
-    let proto = root.join("ax/v1alpha1/ax.proto");
-    println!("cargo:rerun-if-changed={}", proto.display());
+    // AX's imports are relative to its repository root, as here.
+    let dir = root.join("pkg/apis/v1alpha1");
+    let proto = dir.join("ax.proto");
+    println!("cargo:rerun-if-changed={}", dir.display());
 
     let fds = protox::compile([&proto], [&root])?;
     let out = PathBuf::from(env::var("OUT_DIR")?);
