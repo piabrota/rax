@@ -28,19 +28,22 @@ The port lands in four steps, each its own pull request:
 
 | Crate | Go counterpart | Role |
 |---|---|---|
-| `crates/rax-api` | `pkg/apis/v1alpha1` | Generated types and gRPC service, YAML encoding, validation |
+| `crates/rax-api` | `pkg/apis/v1alpha1`, `internal/apivalidation`, `internal/resources` | Generated types and gRPC service (with the Substrate messages a Gateway's egress rules use), YAML encoding, validation |
 | `crates/rax-store` | `internal/store`, `internal/lock` | In-memory and PostgreSQL stores, in-memory and PostgreSQL locks |
 | `crates/rax-substrate` | `internal/substrate` | The Substrate control API client (gRPC over rustls), actor templates, readiness probes, and an in-memory Substrate for tests |
+| `crates/rax-otelenv` | `internal/telemetry/otelenv` | The `OTEL_*_EXPORTER` rules and the telemetry resource, shared by rax-server and the CLI |
 | `crates/rax-server` | `internal/server`, `internal/controller`, `internal/telemetry`, `internal/axattr`, `cmd/ax-server` | The gRPC service and `/healthz` on one port, the task reconciler, OpenTelemetry setup and Prometheus `/metrics`, and the `rax-server` binary |
 | `crates/rax-guest` | Substrate's `env/guest`, `internal/guest` | The guest data plane inside each task (process and filesystem services, which `ssh` uses) and its client |
 | `crates/rax-task-runner` | `runner`, `internal/metadata`, `internal/workspace`, `cmd/ax-task-runner` | The process inside every task container: workspace setup, the probe, metadata and guest server, and the supervised task command |
 | `crates/rax-claude-code-runner` | `cmd/runners/claude-code-runner` | A task runner that turns `spec.config` into a headless `claude --print` session; the runner of the Claude Code image (`Dockerfile.claude-code`) |
-| `crates/rax-cli` | `cmd/ax`, `internal/tunnel` | The `rax` CLI: `apply`, `get`, `describe`, `suspend`, `resume`, `delete`, `ssh`, `ctx`, `tunnel`, `version`, with kubectl tunnels and router mTLS |
+| `crates/rax-cli` | `cmd/ax`, `internal/tunnel` | The `rax` CLI: `apply`, `get`, `describe`, `suspend`, `resume`, `delete`, `ssh`, `ctx`, `tunnel`, `version`, with kubectl tunnels, router mTLS and `--trace` |
 
 The PostgreSQL store uses AX's schema and the same protobuf JSON documents,
 so RAX and AX can read each other's records.
 
-AX's protos are copied unchanged to `proto/pkg/apis/v1alpha1` and compiled in
+AX's protos are copied unchanged to `proto/pkg/apis/v1alpha1`, with the
+Substrate proto that `gateway.proto` imports in `proto/substrate` (where AX
+links Substrate's Go module to `.tmp/buf/substrate`), and compiled in
 pure Rust with [protox](https://crates.io/crates/protox), so building needs no
 `protoc`; `just proto-lint` runs AX's `buf format` and `buf lint` over them. [pbjson](https://crates.io/crates/pbjson-build)
 generates serde impls that follow the protobuf JSON mapping, which is what
@@ -75,7 +78,10 @@ rax ssh my-task -- ls -la /workspace
 ```
 
 Without `--server` or `$AX_SERVER`, it port-forwards to `svc/ax-server` in the
-current Kubernetes context, as `ax` does.
+current Kubernetes context, as `ax` does. `--trace` traces the command and
+prints its trace ID to stderr; its RPCs send a sampled W3C `traceparent`, and
+the spans are exported over OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set
+([CLI traces](docs/observability.md#cli-traces)).
 
 ## The task-runner image
 
@@ -165,13 +171,13 @@ refuses leaves the task `Pending`, to retry.
 ## Parity with AX
 
 **RAX covers everything AX ships**, as of AX's `main` at
-`dcdfd0a` (2026-11-10): the
+`f3e6ecc` (2026-11-12): the
 control plane (`ax-server`), the process inside each task container
 (`ax-task-runner`, including the guest services `ax ssh` talks to), the
 Claude Code runner and its image, and the CLI (`ax`, with its tunnels). The
 one AX package not ported, `internal/model`, is a Gemini client library that
-no AX binary uses. Counting AX's hand-written, non-test Go, 8,328 of 8,950
-lines (93%) have a Rust counterpart; the rest is `internal/model`. RAX also ports
+no AX binary uses. Counting AX's hand-written, non-test Go, 9,332 of 9,954
+lines (94%) have a Rust counterpart; the rest is `internal/model`. RAX also ports
 the part of Substrate's `env` module that AX's runner embeds (`guest`, about
 1,300 lines), so no Go runs inside a RAX task.
 
@@ -185,15 +191,15 @@ and runner, and so on (see [What is tested](#what-is-tested)).
 
 | AX package | What it does | RAX | Status |
 |---|---|---|---|
-| `pkg/apis/v1alpha1` (protos, types, resources) | The per-resource protos (copied unchanged, linted with AX's `buf.yaml`), Task, Workspace and Model types, YAML and JSON encoding, name and spec validation, CPU and memory quantities | `rax-api` | done |
+| `pkg/apis/v1alpha1`, `internal/apivalidation`, `internal/resources` | The per-resource protos (copied unchanged, linted with AX's `buf.yaml`), Task, Workspace, Gateway and Model types, YAML and JSON encoding, name and spec validation (a Gateway's egress rules: one kind per rule, no `*`, IP addresses or `localhost`, credentials only on `https` rules without wildcards, ports on `tlsPassthrough`), CPU and memory quantities | `rax-api` | done |
 | `internal/store`, `store/memory`, `store/postgres` | Resource store; PostgreSQL with AX's schema | `rax-store` | done (no TLS to PostgreSQL yet) |
 | `internal/lock`, `store/postgres/lock.go` | Per-resource locks; PostgreSQL leases with renewal and takeover | `rax-store` | done |
-| `internal/server` | The `ax.v1alpha1.AX` gRPC API (all 14 RPCs), actor-owned status, bound workspaces checked before a task is stored, `/healthz` | `rax-server` | done |
+| `internal/server` | The `ax.v1alpha1.AX` gRPC API (all 19 RPCs, Gateway CRUD included), actor-owned status, bound workspaces checked before a task is stored, `spec.gateway` refused with `Unimplemented` until gateway rules are enforced, `/healthz` | `rax-server` | done |
 | `cmd/ax-server` | Server binary, flags and environment | `rax-server` binary | done (same flags, `--metrics-addr` too) |
-| `internal/telemetry`, `internal/axattr` | OpenTelemetry: OTLP traces (10% of new traces, parent based), metrics and events (stdout unless `OTEL_LOGS_EXPORTER` selects otlp), Prometheus `/metrics` on `:9090`, JSON logs with trace IDs, `OTEL_*` settings that keep the default when invalid; AX's attribute names | `rax-server::telemetry`, `rax-server::axattr` | done (same settings, ports and names) |
+| `internal/telemetry`, `internal/telemetry/otelenv`, `internal/axattr` | OpenTelemetry: OTLP traces (10% of new traces, parent based), metrics and events (stdout unless `OTEL_LOGS_EXPORTER` selects otlp), Prometheus `/metrics` on `:9090`, JSON logs with trace IDs, `OTEL_*` settings that keep the default when invalid; AX's attribute names | `rax-server::telemetry`, `rax-otelenv`, `rax-server::axattr` | done (same settings, ports and names) |
 | `internal/substrate` | Substrate control API client (`substrate.ateapi.v1`, Substrate v1.0.0): TLS, token, retries, atespaces, templates with the cluster-wide snapshot location, actors | `rax-substrate` | done |
 | `internal/controller` | Task reconciler: per-task templates, explicit `Suspend`, `Resume` and `Delete`, workspace readiness, delete cleanup | `rax-server::controller` | done |
-| `cmd/ax` | CLI: `apply`, `get`, `describe`, `suspend`, `resume`, `delete`, `ssh`, `ctx`/`context`, `tunnel list`/`stop`, `version` | `rax-cli` (`rax`) | done (same flags, output and exit codes) |
+| `cmd/ax` | CLI: `apply`, `get`, `describe`, `suspend`, `resume`, `delete` (tasks, workspaces, gateways, models), `ssh`, `ctx`/`context`, `tunnel list`/`stop`, `version`, `--trace` | `rax-cli` (`rax`) | done (same flags, output and exit codes) |
 | `internal/tunnel` | CLI tunnels: per-context state, `kubectl port-forward`, router TLS through a PodCertificateRequest, cached no longer than the certificate is valid | `rax-cli::tunnel`, `rax-cli::router_tls` | done (same state and cache files) |
 | `internal/guest` | Client for the in-actor guest daemon (`ax ssh`: exec, stdin, signals, Ctrl-C twice to leave) | `rax-guest::client` | done |
 | Substrate `env/guest` (embedded by AX's runner) | Guest daemon: process service with spooled output, stdin, signals, limits; filesystem service; reflection | `rax-guest` | done |
@@ -228,7 +234,10 @@ and runner, and so on (see [What is tested](#what-is-tested)).
   in AX.
 - OTLP export has no TLS: the collector endpoint must be `http://`, as in
   AX's manifests.
-- rax-server's telemetry resource is `service.name=rax-server`. `/metrics`
+- rax-server's telemetry resource is `service.name=rax-server`, and the
+  CLI's is `service.name=rax`, with a root span named `rax <command>`.
+  OpenTelemetry's own errors in the CLI are not printed as warnings; a failed
+  export is. `/metrics`
   serves process metrics but no Go runtime metrics (`go_*`), and
   `OTEL_GO_X_CARDINALITY_LIMIT`, a Go SDK setting, is not read: the limit
   stays at 2000 attribute sets per instrument. Log lines have slog's keys but
@@ -240,15 +249,15 @@ and runner, and so on (see [What is tested](#what-is-tested)).
 
 ### What is tested
 
-191 tests, all run in CI (`cargo test --all`, with a PostgreSQL 16 service).
+201 tests, all run in CI (`cargo test --all`, with a PostgreSQL 16 service).
 They port the Go tests for the packages above and add some of their own.
 
 | Suite | Tests | Covers |
 |---|---|---|
-| `rax-api` unit | 21 | YAML round trips and strict decoding (unknown fields rejected), lenient decoding, Workspace MCP and Model secret-key spellings, task config, workspace binding, name/meta/task/file validation, resource validation, CPU and memory parsing |
-| `rax-store` unit | 12 | One conformance suite run on both the memory and the PostgreSQL store (CRUD, defaults, paging, not-found), concurrent schema creation, records with unknown fields, lock serialization, cancellation, lease renewal and takeover of expired leases, a crashed server's tasks kept and its locks freed after a restart, URL redaction |
-| `rax-server` unit | 20 | Telemetry exporter lists and sampler settings (kept on invalid values, described as Go describes them), slog-style times, event levels and attribute kinds; actor state to task phase and Ready, stored status keeps only AX's fields, `/healthz`, template naming and digest, the template name pattern, worker and router addresses, Go-style `:port` listen addresses; the pod runner's manifests, pod phases, retryable errors, one run per resume and label-scoped listing |
-| `rax-server` `tests/service.rs` | 18 | gRPC round trip over the real router, invalid names, workspace binding, bound workspace required (missing, other atespace, store error), suspend and resume lifecycle, delete (terminating, cleanup failure, status write failure), suspend success and failure, actor state read from Substrate, new tasks start suspended, failed and transiently failed provisioning, a later success clearing a stored failure, a suspend cancelling a failed delete, creation time kept, concurrent creates serialized |
+| `rax-api` unit | 24 | YAML round trips and strict decoding (unknown fields rejected), lenient decoding, Workspace MCP and Model secret-key spellings, a Gateway's egress rules, task config, workspace and gateway binding, gateway egress validation, name/meta/task/file validation, resource validation, CPU and memory parsing |
+| `rax-store` unit | 12 | One conformance suite run on both the memory and the PostgreSQL store (CRUD for every kind, newest first, defaults, paging, not-found), concurrent schema creation, records with unknown fields, lock serialization, cancellation, lease renewal and takeover of expired leases, a crashed server's tasks kept and its locks freed after a restart, URL redaction |
+| `rax-server` unit | 19 | Telemetry sampler settings (kept on invalid values, described as Go describes them), slog-style times, event levels and attribute kinds; actor state to task phase and Ready, stored status keeps only AX's fields, `/healthz`, template naming and digest, the template name pattern, worker and router addresses, Go-style `:port` listen addresses; the pod runner's manifests, pod phases, retryable errors, one run per resume and label-scoped listing |
+| `rax-server` `tests/service.rs` | 20 | gRPC round trip over the real router, invalid names, workspace binding, gateway binding refused, Gateway create, update, get, list and delete (exists, missing, invalid, creation time kept), bound workspace required (missing, other atespace, store error), suspend and resume lifecycle, delete (terminating, cleanup failure, status write failure), suspend success and failure, actor state read from Substrate, new tasks start suspended, failed and transiently failed provisioning, a later success clearing a stored failure, a suspend cancelling a failed delete, creation time kept, concurrent creates serialized |
 | `rax-server` `tests/controller.rs` | 17 | Ports of AX's reconciler tests against an in-memory Substrate: actor named after the task, worker IP, default image, suspend and failed suspend, rejected template (bare Substrate message, no fallback), transient template failure, workspace readiness polled directly and through the router and kept across suspend and resume, no new template on status changes, resource limits and their failure paths, delete removes only the task's templates, waits for the actor, times out, transient failures and recovery; plus a full create, resume, get, suspend and delete through the service |
 | `rax-server` `tests/telemetry.rs` | 9 | Ports of AX's telemetry tests against an in-process OTLP/gRPC collector: all signals exported with the resource, exporters turned off with `none`, events on stdout by default and on both with `otlp,console`, the 10% parent-based default sampler and invalid settings keeping it, trace-context-only propagation, `/metrics` with instruments and process metrics, JSON log lines with trace and span IDs and span fields |
 | `rax-substrate` unit | 11 | Retry and backoff rules, transient errors, template building (no snapshot location unless given), resource limits, TLS config, HTTP readiness probe |
@@ -258,16 +267,19 @@ They port the Go tests for the packages above and add some of their own.
 | `rax-task-runner` unit | 13 | First-run marker on the workspace volume, the marker inside `.git` after a clone into the root, legacy markers migrated only for their own workspace, a linked marker directory refused, git clone into a subdirectory with depth, git errors withholding the marker, inlined files, marker names, clone destinations, spec loading with unknown fields and empty specs |
 | `rax-task-runner` `tests/runner.rs` | 8 | Ports of AX's runner, metadata and guest client tests: command env, working directory and exit code, serving after the command exits, stopping the command's process group, waiting without a command, bound workspace setup and readiness, metadata only on loopback, guest services only with `spec.debug`, exec with stdin, empty stdin, exit codes and forwarded signals |
 | `rax-claude-code-runner` unit | 7 | Ports of AX's claude-code-runner tests: rejected configs, the minimal invocation, flags by value type in sorted order, the Workspace's MCP servers as `--mcp-config` byte for byte, Go-style JSON escaping and numbers, `spec.command` left alone |
-| `rax-cli` unit | 20 | Ports of AX's argument parsing (with `-n` over `$AX_SYSTEM_NAMESPACE`), `ssh` argument and Ctrl-C escalation tests, tunnel context names and the port-forward pattern, AX's tunnel state files, tabwriter-style tables, Go `%v` values, document splitting, kinds, worker addresses, router TLS configs, router certificate expiry in the cache |
-| `rax-cli` `tests/cli.rs` | 5 | Ports of AX's CLI tests, running the `rax` binary against rax-server: `apply` atespaces for every kind, immutable tasks, `unchanged` and `configured`, empty and invalid documents, `get` aliases and missing resources, exact `describe` output, `delete`, and the offline commands (`version`, `ctx`, `tunnel list`/`stop`, usage) |
-| `rax-cli` `tests/e2e_local.rs` | 7 | AX's seven E2E scenarios, replayed without Kubernetes through the CLI binary against rax-server, an in-memory Substrate and real task-runners: CLI version, workspace and model CRUD, task lifecycle and Substrate sync, metadata server and guest exec, workspace setup with files and git, suspend and resume persistence, describe and atespace isolation |
+| `rax-otelenv` unit | 1 | Exporter lists: case, spaces, `none`, contradictions and unknown names keeping the default |
+| `rax-cli` unit | 23 | Ports of AX's argument parsing (with `-n` over `$AX_SYSTEM_NAMESPACE`, and `--trace`), command spans and steps, `grpc-message` decoding, `ssh` argument and Ctrl-C escalation tests, tunnel context names and the port-forward pattern, AX's tunnel state files, tabwriter-style tables, Go `%v` values, document splitting, kinds, worker addresses, router TLS configs, router certificate expiry in the cache |
+| `rax-cli` `tests/cli.rs` | 7 | Ports of AX's CLI tests, running the `rax` binary against rax-server: `apply` atespaces for every kind, immutable tasks, `unchanged` and `configured`, empty and invalid documents, `get` aliases and missing resources, exact `describe` and gateway list output, `delete`, the offline commands (`version`, `ctx`, `tunnel list`/`stop`, usage), and `--trace`: the trace ID, a sampled `traceparent` on each RPC and none without the flag, one OTLP export with `service.name=rax` and the command, lookup and RPC spans, and a warning when the collector is unreachable |
+| `rax-cli` `tests/e2e_local.rs` | 7 | AX's E2E scenarios, replayed without Kubernetes through the CLI binary against rax-server, an in-memory Substrate and real task-runners: CLI version, workspace, gateway and model CRUD, task lifecycle and Substrate sync, metadata server and guest exec, workspace setup with files and git, suspend and resume persistence, describe and atespace isolation |
 
 The local E2E replay can swap in AX's Go binaries (`RAX_E2E_CLI`,
 `RAX_E2E_RUNNER`, `RAX_E2E_SERVER` with `RAX_E2E_STORE`; `just e2e-local`).
-All seven scenarios pass with: RAX everywhere; AX's `ax` against RAX; AX's
-`ax-task-runner` under RAX; AX's `ax-server` (PostgreSQL) with RAX's CLI and
-runner; `rax-server` on PostgreSQL with AX's CLI and runner; and AX's Go
-stack alone, which shows the replay asks what AX's suite asks.
+As of AX `dcdfd0a`, all seven scenarios passed with: RAX everywhere; AX's
+`ax` against RAX; AX's `ax-task-runner` under RAX; AX's `ax-server`
+(PostgreSQL) with RAX's CLI and runner; `rax-server` on PostgreSQL with AX's
+CLI and runner; and AX's Go stack alone, which shows the replay asks what
+AX's suite asks. The gateway steps added since have run with RAX everywhere
+only.
 
 Not tested yet: against a real Agent Substrate (only the in-memory one), the
 `ssh` path through the atenet router with mTLS, the task-runner image
