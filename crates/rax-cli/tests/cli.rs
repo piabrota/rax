@@ -65,7 +65,7 @@ type ApplyCase = (
 
 #[tokio::test(flavor = "multi_thread")]
 async fn apply_atespace() {
-    for kind in ["Task", "Workspace", "Model"] {
+    for kind in ["Task", "Workspace", "Gateway", "Model"] {
         let cases: [ApplyCase; 6] = [
             ("", &[], Some("default"), None),
             ("", &["-a", "team-a"], Some("team-a"), None),
@@ -136,6 +136,11 @@ async fn apply_atespace() {
                     "Workspace" => env
                         .store
                         .get_workspace(ns, "example")
+                        .await
+                        .map(|t| t.metadata),
+                    "Gateway" => env
+                        .store
+                        .get_gateway(ns, "example")
                         .await
                         .map(|t| t.metadata),
                     _ => env.store.get_model(ns, "example").await.map(|t| t.metadata),
@@ -282,6 +287,13 @@ async fn get_resource_aliases() {
             .await
             .unwrap();
         store
+            .save_gateway(&mut rax_api::v1alpha1::Gateway {
+                metadata: meta.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
             .save_model(&mut rax_api::v1alpha1::Model {
                 metadata: meta,
                 ..Default::default()
@@ -290,7 +302,7 @@ async fn get_resource_aliases() {
             .unwrap();
     }
     let env = serve(store).await;
-    for resource in ["task", "workspace", "model"] {
+    for resource in ["task", "workspace", "gateway", "model"] {
         for alias in [resource.to_owned(), format!("{resource}s")] {
             // List.
             let (code, out, err) = rax(&env, &["-a", NS, "get", &alias]);
@@ -350,6 +362,18 @@ spec:
     path: /workspace/.agents/skills
 ---
 apiVersion: ax.io/v1alpha1
+kind: Gateway
+metadata:
+  name: gw
+spec:
+  egress:
+  - https:
+      hostnames: [api.example.com, github.com]
+  - tlsPassthrough:
+      hostnames: [db.example.com]
+      ports: {numbers: [5432]}
+---
+apiVersion: ax.io/v1alpha1
 kind: Model
 metadata:
   name: m
@@ -381,7 +405,7 @@ spec:
     assert_eq!(code, 0, "{err}");
     assert_eq!(
         out,
-        "workspace.ax.io/ws created\nmodel.ax.io/m created\ntask.ax.io/t created\n"
+        "workspace.ax.io/ws created\ngateway.ax.io/gw created\nmodel.ax.io/m created\ntask.ax.io/t created\n"
     );
 
     let (_, out, _) = rax(&env, &["describe", "workspace", "ws"]);
@@ -389,6 +413,13 @@ spec:
         out,
         "Name:         ws\nAtespace:     default\nGit Repositories:\n  - origin (https://example.com/r.git, branch: main)\nMCP Servers:\n  - local-mcp: http://localhost:9000\nSkills Path:      /workspace/.agents/skills\n"
     );
+    let (_, out, _) = rax(&env, &["describe", "gateway", "gw"]);
+    assert_eq!(
+        out,
+        "Name:         gw\nAtespace:     default\nEgress Rules:\n  - https: api.example.com, github.com\n  - tlsPassthrough: db.example.com\n"
+    );
+    let (_, out, _) = rax(&env, &["get", "gateways"]);
+    assert_eq!(out, "NAME   ATESPACE   EGRESS-RULES\ngw     default    2\n");
     let (_, out, _) = rax(&env, &["describe", "model", "m"]);
     assert_eq!(
         out,
@@ -404,7 +435,12 @@ spec:
         "{out}"
     );
 
-    for (kind, name) in [("task", "t"), ("workspaces", "ws"), ("Model", "m")] {
+    for (kind, name) in [
+        ("task", "t"),
+        ("workspaces", "ws"),
+        ("Gateway", "gw"),
+        ("Model", "m"),
+    ] {
         let (code, out, err) = rax(&env, &["delete", kind, name]);
         assert_eq!(code, 0, "{err}");
         let lower = kind.to_lowercase();
@@ -491,4 +527,175 @@ fn offline_commands() {
     );
     let (_, out, _) = run(&["--context", "kind-ax", "ctx"]);
     assert!(out.contains("No background tunnel running"), "{out}");
+}
+
+/// `--trace` prints the trace ID and sends it, sampled, as `traceparent` on
+/// every RPC; without it, the CLI sends no trace context.
+#[tokio::test(flavor = "multi_thread")]
+async fn trace_flag() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let lis = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = lis.local_addr().unwrap().to_string();
+    let app = router(AxService::new(
+        Arc::new(MemoryStore::new()),
+        ServerOptions::default(),
+    ))
+    .layer(axum::middleware::from_fn({
+        let seen = seen.clone();
+        move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let seen = seen.clone();
+            async move {
+                let tp = req
+                    .headers()
+                    .get("traceparent")
+                    .map(|v| v.to_str().unwrap().to_owned())
+                    .unwrap_or_default();
+                seen.lock().unwrap().push(tp);
+                next.run(req).await
+            }
+        }
+    }));
+    tokio::spawn(async move { axum::serve(lis, app).await.unwrap() });
+    let home = tempfile::tempdir().unwrap();
+    let run = |args: &[&str], envs: &[(&str, &str)]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_rax"))
+            .args(["--server", &addr])
+            .args(args)
+            .env("AX_HOME", home.path())
+            .env_remove("AX_SERVER")
+            .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .env_remove("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+            .env_remove("OTEL_TRACES_EXPORTER")
+            .envs(envs.iter().copied())
+            .output()
+            .unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    let (code, err) = run(&["get", "tasks"], &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!err.contains("Trace ID"), "{err}");
+    assert_eq!(seen.lock().unwrap().drain(..).collect::<Vec<_>>(), [""]);
+
+    let (code, err) = run(&["--trace", "get", "tasks"], &[]);
+    assert_eq!(code, 0, "{err}");
+    let id = err
+        .lines()
+        .find_map(|l| l.strip_prefix("Trace ID: "))
+        .unwrap_or_else(|| panic!("no trace ID in {err:?}"));
+    assert_eq!(id.len(), 32, "{id}");
+    let sent: Vec<_> = seen.lock().unwrap().drain(..).collect();
+    assert_eq!(sent.len(), 1);
+    let parts: Vec<_> = sent[0].split('-').collect();
+    assert_eq!((parts[0], parts[1], parts[3]), ("00", id, "01"), "{sent:?}");
+    assert!(!err.contains("Warning"), "{err}");
+
+    // The spans go to the collector the environment names; one that is not
+    // there is a warning, not a failure.
+    let (code, err) = run(
+        &["get", "tasks", "--trace"],
+        &[("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("Warning: could not export the command trace to http://127.0.0.1:1"),
+        "{err}"
+    );
+    // A failed command still ends its trace.
+    let (code, err) = run(&["--trace", "get", "task", "missing"], &[]);
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("Trace ID: ") && err.contains("NotFound"),
+        "{err}"
+    );
+}
+
+/// A collector that keeps the trace exports it receives.
+#[derive(Default, Clone)]
+struct Collector(
+    Arc<
+        std::sync::Mutex<
+            Vec<opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest>,
+        >,
+    >,
+);
+
+#[tonic::async_trait]
+impl opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceService
+    for Collector
+{
+    async fn export(
+        &self,
+        req: tonic::Request<
+            opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest,
+        >,
+    ) -> Result<
+        tonic::Response<
+            opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceResponse,
+        >,
+        tonic::Status,
+    > {
+        self.0.lock().unwrap().push(req.into_inner());
+        Ok(tonic::Response::new(Default::default()))
+    }
+}
+
+/// With an OTLP endpoint, the command's spans are exported once, when it
+/// ends: the command span, the address lookup and one client span per RPC.
+#[tokio::test(flavor = "multi_thread")]
+async fn trace_export() {
+    use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceServiceServer;
+    use opentelemetry_proto::tonic::common::v1::any_value::Value;
+    let env = serve(Arc::new(MemoryStore::new())).await;
+    let collector = Collector::default();
+    let lis = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let otlp = format!("http://{}", lis.local_addr().unwrap());
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(TraceServiceServer::new(collector.clone()))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(lis)),
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_rax"))
+        .args(["--server", &env.addr, "--trace", "get", "workspaces"])
+        .env("AX_HOME", env.home.path())
+        .env_remove("AX_SERVER")
+        .env_remove("OTEL_TRACES_EXPORTER")
+        .env_remove("OTEL_SERVICE_NAME")
+        .env("OTEL_EXPORTER_OTLP_ENDPOINT", &otlp)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(!err.contains("Warning"), "{err}");
+
+    let exports = collector.0.lock().unwrap().clone();
+    assert_eq!(exports.len(), 1, "one export per command");
+    let rs = &exports[0].resource_spans[0];
+    let service = rs
+        .resource
+        .as_ref()
+        .unwrap()
+        .attributes
+        .iter()
+        .find(|a| a.key == "service.name")
+        .and_then(|a| a.value.as_ref()?.value.clone());
+    assert_eq!(service, Some(Value::StringValue("rax".into())));
+    let mut names: Vec<_> = rs
+        .scope_spans
+        .iter()
+        .flat_map(|s| &s.spans)
+        .map(|s| s.name.as_str())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "ax.v1alpha1.AX/ListWorkspaces",
+            "rax get",
+            "resolve ax-server address"
+        ]
+    );
 }

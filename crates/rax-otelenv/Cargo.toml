@@ -1,0 +1,12 @@
+[package]
+name = "rax-otelenv"
+description = "The OpenTelemetry environment rules rax-server and the rax CLI share"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+opentelemetry = { workspace = true, features = ["trace"] }
+opentelemetry_sdk = { workspace = true, features = ["trace"] }
+opentelemetry-semantic-conventions.workspace = true

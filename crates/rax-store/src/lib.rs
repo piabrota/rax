@@ -13,7 +13,7 @@ mod memory;
 mod postgres;
 
 use async_trait::async_trait;
-use rax_api::v1alpha1::{Model, ObjectMeta, Task, TaskStatus, Workspace};
+use rax_api::v1alpha1::{Gateway, Model, ObjectMeta, Task, TaskStatus, Workspace};
 
 pub use lock::{LockGuard, Locker, MemoryLocker, lock_key};
 pub use memory::MemoryStore;
@@ -61,7 +61,7 @@ pub trait TaskStore: Send + Sync {
     async fn delete_task(&self, atespace: &str, name: &str) -> Result<()>;
 }
 
-/// Workspace and model records.
+/// Workspace, gateway and model records.
 #[async_trait]
 pub trait ResourceStore: Send + Sync {
     async fn save_workspace(&self, ws: &mut Workspace) -> Result<()>;
@@ -70,6 +70,14 @@ pub trait ResourceStore: Send + Sync {
     /// is empty or `*`, most recently saved first.
     async fn list_workspaces(&self, atespace: &str) -> Result<Vec<Workspace>>;
     async fn delete_workspace(&self, atespace: &str, name: &str) -> Result<()>;
+
+    async fn save_gateway(&self, gw: &mut Gateway) -> Result<()>;
+    async fn get_gateway(&self, atespace: &str, name: &str) -> Result<Gateway>;
+    /// Lists gateways in an atespace, or across all of them when `atespace`
+    /// is empty or `*`, most recently saved first.
+    async fn list_gateways(&self, atespace: &str) -> Result<Vec<Gateway>>;
+    /// Removes a gateway. Deleting a missing gateway is not an error.
+    async fn delete_gateway(&self, atespace: &str, name: &str) -> Result<()>;
 
     async fn save_model(&self, model: &mut Model) -> Result<()>;
     async fn get_model(&self, atespace: &str, name: &str) -> Result<Model>;
@@ -130,6 +138,12 @@ pub(crate) fn prepare_task(task: &mut Task) -> Result<()> {
 pub(crate) fn prepare_workspace(ws: &mut Workspace) -> Result<()> {
     default_meta(&mut ws.metadata, "workspace")?;
     default_type(&mut ws.api_version, &mut ws.kind, rax_api::KIND_WORKSPACE);
+    Ok(())
+}
+
+pub(crate) fn prepare_gateway(gw: &mut Gateway) -> Result<()> {
+    default_meta(&mut gw.metadata, "gateway")?;
+    default_type(&mut gw.api_version, &mut gw.kind, rax_api::KIND_GATEWAY);
     Ok(())
 }
 
@@ -274,6 +288,33 @@ pub(crate) mod testing {
             s.get_workspace("team", "ws2").await,
             Err(StoreError::NotFound)
         ));
+
+        for g in ["g1", "g2"] {
+            let mut gw = Gateway {
+                metadata: Some(ObjectMeta {
+                    name: g.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            s.save_gateway(&mut gw).await.unwrap();
+            assert_eq!(gw.kind, rax_api::KIND_GATEWAY);
+            assert_eq!(s.get_gateway("default", g).await.unwrap(), gw);
+        }
+        assert_eq!(
+            names(&s.list_gateways("*").await.unwrap(), |g| &g.metadata),
+            ["g2", "g1"]
+        );
+        s.delete_gateway("default", "g1").await.unwrap();
+        s.delete_gateway("default", "g1").await.unwrap();
+        assert!(matches!(
+            s.get_gateway("default", "g1").await,
+            Err(StoreError::NotFound)
+        ));
+        assert_eq!(
+            names(&s.list_gateways("default").await.unwrap(), |g| &g.metadata),
+            ["g2"]
+        );
 
         let mut m = Model {
             metadata: Some(ObjectMeta {

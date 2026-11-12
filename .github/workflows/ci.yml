@@ -32,8 +32,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: shellcheck hack/local/*.sh
       # AX's buf format and lint, over the protos copied from AX (buf.yaml).
-      - run: npx --yes @bufbuild/buf@1.75.0 format --diff --exit-code
-      - run: npx --yes @bufbuild/buf@1.75.0 lint
+      - run: npx --yes @bufbuild/buf@1.75.0 format --diff --exit-code --path proto/pkg/apis
+      - run: npx --yes @bufbuild/buf@1.75.0 lint --path proto/pkg/apis
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all

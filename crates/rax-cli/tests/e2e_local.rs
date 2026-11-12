@@ -410,7 +410,7 @@ async fn cli_version() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn workspace_and_model_crud() {
+async fn workspace_gateway_and_model_crud() {
     let s = stack().await;
     let repo = sample_repo(s.root.path());
     let ws = |env: &str| {
@@ -456,6 +456,47 @@ async fn workspace_and_model_crud() {
         &["deleted"],
     );
     let (ok, _, out) = s.run("default", &["get", "workspace", "ws-crud"]).await;
+    assert!(!ok && out.contains("NotFound"), "{out}");
+
+    // The same lifecycle for a Gateway.
+    let gateway = |host: &str| {
+        format!(
+            "apiVersion: ax.io/v1alpha1\nkind: Gateway\nmetadata:\n  name: gw-crud\n  atespace: default\nspec:\n  egress:\n  - https:\n      hostnames:\n      - {host}\n"
+        )
+    };
+    let r = "gateway.ax.io/gw-crud";
+    assert_contains(
+        "first apply",
+        &s.apply("default", &gateway("a.example.com")).await,
+        &[&format!("{r} created")],
+    );
+    assert_contains(
+        "re-apply",
+        &s.apply("default", &gateway("a.example.com")).await,
+        &[&format!("{r} unchanged")],
+    );
+    assert_contains(
+        "modified",
+        &s.apply("default", &gateway("b.example.com")).await,
+        &[&format!("{r} configured")],
+    );
+    assert_contains(
+        "get gateways",
+        &s.must("default", &["get", "gateways"]).await,
+        &["gw-crud"],
+    );
+    assert_contains(
+        "get gateway",
+        &s.must("default", &["get", "gateway", "gw-crud"]).await,
+        &["b.example.com"],
+    );
+    assert_contains(
+        "describe gateway",
+        &s.must("default", &["describe", "gateway", "gw-crud"]).await,
+        &["https: b.example.com"],
+    );
+    s.must("default", &["delete", "gateway", "gw-crud"]).await;
+    let (ok, _, out) = s.run("default", &["get", "gateway", "gw-crud"]).await;
     assert!(!ok && out.contains("NotFound"), "{out}");
 
     let model = |m: &str| {

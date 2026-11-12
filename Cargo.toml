@@ -59,6 +59,7 @@ tempfile = "3"
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
 tonic-reflection = "0.14"
 rax-guest = { path = "crates/rax-guest" }
+rax-otelenv = { path = "crates/rax-otelenv" }
 rax-task-runner = { path = "crates/rax-task-runner" }
 x509-parser = { version = "0.16", default-features = false }
 opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs"] }

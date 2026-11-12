@@ -2,8 +2,12 @@
 //! SDK, so that a value it does not understand keeps rax-server's default
 //! instead of, say, sampling every trace or turning export off.
 
-use std::collections::BTreeSet;
 use std::fmt;
+
+pub use rax_otelenv::{
+    EXPORTER_CONSOLE, EXPORTER_NONE, EXPORTER_OTLP, EXPORTER_PROMETHEUS, Exporters,
+    resolve_exporters,
+};
 
 use opentelemetry_sdk::trace::Sampler;
 
@@ -12,39 +16,6 @@ pub(crate) const METRICS_EXPORTER_ENV: &str = "OTEL_METRICS_EXPORTER";
 pub(crate) const LOGS_EXPORTER_ENV: &str = "OTEL_LOGS_EXPORTER";
 pub(crate) const TRACES_SAMPLER_ENV: &str = "OTEL_TRACES_SAMPLER";
 pub(crate) const TRACES_SAMPLER_ARG_ENV: &str = "OTEL_TRACES_SAMPLER_ARG";
-
-/// The names the `OTEL_*_EXPORTER` variables use. `none` selects the empty
-/// set; it is not an exporter.
-pub const EXPORTER_OTLP: &str = "otlp";
-pub const EXPORTER_CONSOLE: &str = "console";
-pub const EXPORTER_PROMETHEUS: &str = "prometheus";
-pub const EXPORTER_NONE: &str = "none";
-
-/// The set of exporters an `OTEL_*_EXPORTER` variable selects. The empty set
-/// is `none`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Exporters(BTreeSet<String>);
-
-impl Exporters {
-    pub fn of(names: &[&str]) -> Self {
-        Exporters(names.iter().map(|n| n.to_string()).collect())
-    }
-
-    pub fn has(&self, name: &str) -> bool {
-        self.0.contains(name)
-    }
-}
-
-/// Lists the names in order, or `none`.
-impl fmt::Display for Exporters {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.0.is_empty() {
-            return f.write_str(EXPORTER_NONE);
-        }
-        let names: Vec<&str> = self.0.iter().map(String::as_str).collect();
-        f.write_str(&names.join(","))
-    }
-}
 
 /// Reads `env` and applies [`resolve_exporters`]. A problem with the value is
 /// logged, not returned: a telemetry setting never stops startup.
@@ -55,56 +26,6 @@ pub(crate) fn resolve_exporters_env(env: &str, known: &[&str], def: &Exporters) 
         tracing::warn!(variable = env, value, using = %got, error = err, "invalid OpenTelemetry exporter setting");
     }
     got
-}
-
-/// Reads `value` as a comma-separated exporter list, as the OpenTelemetry
-/// specification allows. Names are trimmed and lowercased; empty and unknown
-/// names are skipped with an error, and the rest apply. A value that is
-/// empty, names no known exporter, or lists `none` with an exporter keeps
-/// `def`, as the specification asks for a setting it cannot use. The returned
-/// set is the one to use even when there is an error.
-pub fn resolve_exporters(
-    env: &str,
-    value: &str,
-    known: &[&str],
-    def: &Exporters,
-) -> (Exporters, Option<String>) {
-    // Unset and empty read the same, because templated manifests can render
-    // an empty variable.
-    if value.trim().is_empty() {
-        return (def.clone(), None);
-    }
-    let mut got = Exporters::default();
-    let mut none = false;
-    let mut skipped = Vec::new();
-    for item in value.split(',') {
-        let name = item.trim().to_lowercase();
-        if name == EXPORTER_NONE {
-            none = true;
-        } else if known.contains(&name.as_str()) {
-            got.0.insert(name);
-        } else {
-            skipped.push(name);
-        }
-    }
-    let skip_err = (!skipped.is_empty())
-        .then(|| format!("{env}: skipped empty or unknown exporters {skipped:?}"));
-    if none && !got.0.is_empty() {
-        return (
-            def.clone(),
-            Some(format!("{env} {value:?} lists none with an exporter")),
-        );
-    }
-    if none {
-        return (Exporters::default(), skip_err);
-    }
-    if got.0.is_empty() {
-        return (
-            def.clone(),
-            Some(format!("{env} {value:?} names no known exporter")),
-        );
-    }
-    (got, skip_err)
 }
 
 /// A trace sampler, as a value that can be compared and described. The SDK's
@@ -231,33 +152,6 @@ pub fn parse_sampler(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn resolves_exporters() {
-        let known = [EXPORTER_OTLP, EXPORTER_CONSOLE];
-        let def = Exporters::of(&[EXPORTER_OTLP]);
-        for (val, want, want_err) in [
-            ("", "otlp", false),
-            (" ", "otlp", false),
-            ("otlp", "otlp", false),
-            (" OTLP ", "otlp", false),
-            ("console", "console", false),
-            ("otlp,console", "console,otlp", false),
-            ("none", "none", false),
-            ("none,", "none", true),
-            ("otlp,none", "otlp", true), // contradictory: keep the default
-            ("otpl", "otlp", true),      // typo: keep the default
-            ("zipkin", "otlp", true),
-            ("zipkin,console", "console", true),
-        ] {
-            let (got, err) = resolve_exporters("OTEL_TEST_EXPORTER", val, &known, &def);
-            assert_eq!(
-                (got.to_string().as_str(), err.is_some()),
-                (want, want_err),
-                "resolve_exporters({val:?}): {err:?}"
-            );
-        }
-    }
 
     #[test]
     fn parses_samplers() {

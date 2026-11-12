@@ -4,20 +4,25 @@ use std::io::Write;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant, SystemTime};
 
-use rax_api::v1alpha1::{self as api, Model, ObjectMeta, Task, Workspace, ax_client::AxClient};
-use rax_api::{KIND_MODEL, KIND_TASK, KIND_WORKSPACE, Manifest, from_yaml, phase, to_yaml};
+use rax_api::v1alpha1::{
+    self as api, Gateway, Model, ObjectMeta, Task, Workspace, ax_client::AxClient,
+};
+use rax_api::{
+    KIND_GATEWAY, KIND_MODEL, KIND_TASK, KIND_WORKSPACE, Manifest, from_yaml, phase, to_yaml,
+};
 use rax_guest::client::go_status;
 use rax_guest::proto::Signal;
 use rax_guest::{Client as GuestClient, ExecOptions};
 use serde_yaml_ng::Value as Yaml;
 use tokio::sync::mpsc;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Endpoint;
 use tonic::{Code, Status};
 
 use crate::Error;
 use crate::args::parse_ssh_args;
 use crate::format::{format_age, go_strings, go_value, sorted, table};
 use crate::router_tls::{ROUTER_SERVER_NAME, router_tls_config};
+use crate::trace::{self, Traced};
 use crate::tunnel;
 
 /// How long suspend and resume may take. Snapshotting or restoring a
@@ -29,14 +34,17 @@ const LIFECYCLE_RPC_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// instead of being forwarded.
 pub const INTERRUPT_EXIT_WINDOW: Duration = Duration::from_secs(1);
 
+/// A client of the AX server, whose calls are traced while the command is.
+pub type AxConn = AxClient<Traced>;
+
 /// Connects to the AX server at `server`, with or without an `http://`.
-pub fn client(server: &str) -> Result<AxClient<Channel>, Error> {
+pub fn client(server: &str) -> Result<AxConn, Error> {
     let target = server
         .trim_start_matches("http://")
         .trim_start_matches("https://");
     let endpoint = Endpoint::from_shared(format!("http://{target}"))
         .map_err(|e| format!("connecting to {target}: {e}"))?;
-    Ok(AxClient::new(endpoint.connect_lazy()))
+    Ok(AxClient::new(Traced::new(endpoint.connect_lazy())))
 }
 
 fn req<T>(msg: T, timeout: Duration) -> tonic::Request<T> {
@@ -179,7 +187,7 @@ fn decode<T: Manifest>(doc: &str) -> Result<T, Error> {
 }
 
 async fn apply_document(
-    client: &mut AxClient<Channel>,
+    client: &mut AxConn,
     doc: &str,
     parsed: &Yaml,
     atespace: Option<&str>,
@@ -240,6 +248,40 @@ async fn apply_document(
                 .into_inner();
             Ok((kind, meta_of(&res.metadata).0.into(), outcome))
         }
+        KIND_GATEWAY => {
+            let mut gw: Gateway = decode(doc)?;
+            set_apply_atespace(gw.metadata.as_mut(), atespace)?;
+            let (name, ns) = meta_of(&gw.metadata);
+            let existing = client
+                .get_gateway(req(
+                    api::GetGatewayRequest {
+                        atespace: ns.into(),
+                        name: name.into(),
+                    },
+                    timeout,
+                ))
+                .await
+                .map(|r| r.into_inner().spec);
+            let outcome = apply_outcome(existing, &gw.spec)?;
+            let res = if outcome == "created" {
+                client
+                    .create_gateway(req(
+                        api::CreateGatewayRequest { gateway: Some(gw) },
+                        timeout,
+                    ))
+                    .await
+            } else {
+                client
+                    .update_gateway(req(
+                        api::UpdateGatewayRequest { gateway: Some(gw) },
+                        timeout,
+                    ))
+                    .await
+            }
+            .map_err(&err)?
+            .into_inner();
+            Ok((kind, meta_of(&res.metadata).0.into(), outcome))
+        }
         KIND_MODEL => {
             let mut m: Model = decode(doc)?;
             set_apply_atespace(m.metadata.as_mut(), atespace)?;
@@ -264,7 +306,7 @@ async fn apply_document(
         }
         "" => Err("missing kind".into()),
         other => Err(format!(
-            "unsupported kind {other:?} (expected Task, Workspace, or Model)"
+            "unsupported kind {other:?} (expected Task, Workspace, Gateway, or Model)"
         )),
     }
 }
@@ -406,6 +448,36 @@ pub async fn run_get(server: &str, atespace: &str, args: &[String]) -> Result<()
                 .into_inner();
             print_yaml(&ws)
         }
+        ("gateways" | "gateway", None) => {
+            let list = client
+                .list_gateways(req(api::ListGatewaysRequest { atespace: ns }, t))
+                .await
+                .map_err(status_err("listing gateways"))?
+                .into_inner()
+                .gateways;
+            let mut rows = vec![cells(&["NAME", "ATESPACE", "EGRESS-RULES"])];
+            for gw in &list {
+                let rules = gw.spec.as_ref().map_or(0, |s| s.egress.len());
+                let (name, ns) = meta_of(&gw.metadata);
+                rows.push(vec![name.into(), ns.into(), rules.to_string()]);
+            }
+            print!("{}", table(&rows, 3));
+            Ok(())
+        }
+        ("gateways" | "gateway", Some(name)) => {
+            let gw = client
+                .get_gateway(req(
+                    api::GetGatewayRequest {
+                        atespace: ns,
+                        name: name.clone(),
+                    },
+                    t,
+                ))
+                .await
+                .map_err(status_err(&format!("getting gateway {name:?}")))?
+                .into_inner();
+            print_yaml(&gw)
+        }
         ("models" | "model", None) => {
             let list = client
                 .list_models(req(api::ListModelsRequest { atespace: ns }, t))
@@ -456,7 +528,7 @@ fn struct_json(s: &Option<pbjson_types::Struct>) -> serde_json::Map<String, serd
 
 pub async fn run_describe(server: &str, atespace: &str, args: &[String]) -> Result<(), Error> {
     if args.len() < 2 {
-        return Err("usage: rax describe <task|workspace|model> <name>".into());
+        return Err("usage: rax describe <task|workspace|gateway|model> <name>".into());
     }
     let kind = args[0].to_lowercase();
     let name = args[1].clone();
@@ -498,6 +570,38 @@ pub async fn run_describe(server: &str, atespace: &str, args: &[String]) -> Resu
                     println!("Secret Key:         {}", key.key);
                 } else if !key.name.is_empty() {
                     println!("Secret Key:         {}", key.name);
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if kind == "gateway" || kind == "gateways" {
+        let gw = client
+            .get_gateway(req(
+                api::GetGatewayRequest {
+                    atespace: ns,
+                    name: name.clone(),
+                },
+                t,
+            ))
+            .await
+            .map_err(status_err(&format!("getting gateway {name:?}")))?
+            .into_inner();
+        let (n, a) = meta_of(&gw.metadata);
+        println!("Name:         {n}");
+        println!("Atespace:     {a}");
+        if let Some(spec) = gw.spec.as_ref().filter(|s| !s.egress.is_empty()) {
+            println!("Egress Rules:");
+            for rule in &spec.egress {
+                if let Some(r) = &rule.http {
+                    println!("  - http: {}", r.hostnames.join(", "));
+                }
+                if let Some(r) = &rule.https {
+                    println!("  - https: {}", r.hostnames.join(", "));
+                }
+                if let Some(r) = &rule.tls_passthrough {
+                    println!("  - tlsPassthrough: {}", r.hostnames.join(", "));
                 }
             }
         }
@@ -624,17 +728,18 @@ pub fn normalize_kind(kind: &str) -> Result<&'static str, Error> {
     match lower.strip_suffix('s').unwrap_or(&lower) {
         "task" => Ok(KIND_TASK),
         "workspace" => Ok(KIND_WORKSPACE),
+        "gateway" => Ok(KIND_GATEWAY),
         "model" => Ok(KIND_MODEL),
         "" => Err("missing kind".into()),
         _ => Err(format!(
-            "unsupported kind {kind:?} (expected task, workspace, or model)"
+            "unsupported kind {kind:?} (expected task, workspace, gateway, or model)"
         )),
     }
 }
 
 pub async fn run_delete(server: &str, atespace: &str, args: &[String]) -> Result<(), Error> {
     if args.len() < 2 {
-        return Err("usage: rax delete <task|workspace|model> <name>".into());
+        return Err("usage: rax delete <task|workspace|gateway|model> <name>".into());
     }
     let kind = normalize_kind(&args[0])?;
     let name = args[1].clone();
@@ -659,6 +764,16 @@ pub async fn run_delete(server: &str, atespace: &str, args: &[String]) -> Result
         KIND_WORKSPACE => client
             .delete_workspace(req(
                 api::DeleteWorkspaceRequest {
+                    atespace: ns,
+                    name: name.clone(),
+                },
+                t,
+            ))
+            .await
+            .map(|_| ()),
+        KIND_GATEWAY => client
+            .delete_gateway(req(
+                api::DeleteGatewayRequest {
                     atespace: ns,
                     name: name.clone(),
                 },
@@ -1000,6 +1115,12 @@ pub async fn run_ssh(
     });
     let signals = escalate_interrupts(int_rx, INTERRUPT_EXIT_WINDOW, || {
         eprintln!("\nrax ssh: interrupted twice, exiting");
+        if let Some(t) = trace::active() {
+            t.end_within(
+                Some("rax ssh: interrupted twice"),
+                trace::INTERRUPT_FLUSH_TIMEOUT,
+            );
+        }
         std::process::exit(130);
     });
 

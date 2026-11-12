@@ -13,13 +13,17 @@
 # limitations under the License.
 
 # AX's buf configuration for the protos RAX copies from AX unchanged. buf only
-# formats and lints them here; RAX generates its code with protox and prost
-# (crates/rax-api/build.rs), so there is no buf.gen.yaml.
+# formats and lints them here, and only AX's own (`--path proto/pkg/apis`, as
+# AX's `make generate` passes `--path pkg/apis`); RAX generates its code with
+# protox and prost (crates/rax-api/build.rs), so there is no buf.gen.yaml.
 version: v2
 modules:
   - path: proto # imports are relative to AX's repository root, which proto/ mirrors
     includes:
       - proto/pkg/apis
+  - path: proto/substrate # Substrate's api/ateapi/v1, which gateway.proto imports; AX links it to .tmp/buf/substrate
+    includes:
+      - proto/substrate/api/ateapi/v1
 lint:
   use:
     - STANDARD
