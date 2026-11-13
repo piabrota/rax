@@ -5,6 +5,7 @@ pub mod args;
 pub mod commands;
 pub mod format;
 pub mod router_tls;
+pub mod trace;
 pub mod tunnel;
 
 /// An error to print as `Error: ...` before exiting with status 1.
@@ -16,15 +17,18 @@ Usage:
   rax [command] [flags]
 
 Available Commands:
-  apply -f <file>         Apply resources (tasks, workspaces, models) from a file or stdin
+  apply -f <file>         Apply resources (tasks, workspaces, gateways, models) from a file or stdin
   get tasks               List tasks
   get task <name>         Get a specific task
   get workspaces          List workspaces
   get workspace <name>    Get a specific workspace
+  get gateways            List gateways
+  get gateway <name>      Get a specific gateway
   get models              List models
   get model <name>        Get a specific model
   describe task <name>    Show detailed information about a task
   describe workspace <name> Show detailed information about a workspace
+  describe gateway <name> Show detailed information about a gateway
   describe model <name>   Show detailed information about a model
   ssh <task-name> [-- cmd] Run a command or shell inside the running task container
                           (Ctrl-C is forwarded; press it twice quickly, or Ctrl-\, to exit locally)
@@ -32,6 +36,7 @@ Available Commands:
   resume task <name>      Resume execution of a suspended task
   delete task <name>      Delete a task
   delete workspace <name> Delete a workspace
+  delete gateway <name>   Delete a gateway
   delete model <name>     Delete a model
   ctx, context            Show active Kubernetes context and AX connection
   tunnel <list|stop>      Manage background tunnels to Kubernetes clusters
@@ -41,7 +46,8 @@ Flags:
   -a, --atespace string       Task atespace scope (default: "default")
   -n, --namespace string      Kubernetes namespace where AX is installed (default: "ax-system")
   --context string            Kubernetes context (defaults to active kubectx / current-context)
-  --server string             AX API server address (default: auto-detected from kube context or $AX_SERVER)"#;
+  --server string             AX API server address (default: auto-detected from kube context or $AX_SERVER)
+  --trace                     Trace this command and print its trace ID to stderr"#;
 
 /// Runs the CLI on `argv` (without the program name) and returns the exit
 /// status.
@@ -102,20 +108,34 @@ pub fn run(argv: Vec<String>) -> i32 {
         return 1;
     }
 
-    let server = match tunnel::ensure_server_url(tunnel::Options {
-        server_url: opts.server.clone(),
-        context: opts.kube_context.clone(),
-        namespace: opts.namespace.clone(),
-        ..Default::default()
-    }) {
-        Ok(s) => s,
-        Err(e) => return fail(e),
-    };
-
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("building the tokio runtime");
+    let trace = trace::start(&opts.cmd, opts.trace, rt.handle());
+    // Ends the trace, if any, and prints the error.
+    let finish = |result: Result<(), Error>| {
+        if let Some(t) = &trace {
+            t.end(result.as_ref().err().map(String::as_str));
+        }
+        result.map_or_else(fail, |_| 0)
+    };
+
+    let step = trace
+        .as_ref()
+        .map_or_else(trace::Step::none, |t| t.step("resolve ax-server address"));
+    let resolved = tunnel::ensure_server_url(tunnel::Options {
+        server_url: opts.server.clone(),
+        context: opts.kube_context.clone(),
+        namespace: opts.namespace.clone(),
+        ..Default::default()
+    });
+    step.end(resolved.as_ref().err().map(String::as_str));
+    let server = match resolved {
+        Ok(s) => s,
+        Err(e) => return finish(Err(e)),
+    };
+
     let atespace = opts.atespace.clone();
     let result = rt.block_on(async {
         match opts.cmd.as_str() {
@@ -131,22 +151,29 @@ pub fn run(argv: Vec<String>) -> i32 {
             "ssh" => {
                 // ssh leaves through process::exit so a blocked stdin read
                 // can't hold the runtime open.
-                let code = match commands::run_ssh(
+                let result = commands::run_ssh(
                     &server,
                     &atespace,
                     &opts.kube_context,
                     &opts.namespace,
                     &opts.args,
                 )
-                .await
-                {
-                    Ok(code) => code,
-                    Err(e) => fail(e),
+                .await;
+                let code = match result {
+                    // The remote command's exit code is the CLI's.
+                    Ok(code) => {
+                        if let Some(t) = &trace {
+                            let err = format!("remote command exited with code {code}");
+                            t.end((code != 0).then_some(err.as_str()));
+                        }
+                        code
+                    }
+                    Err(e) => finish(Err(e)),
                 };
                 std::process::exit(code);
             }
             _ => unreachable!(),
         }
     });
-    result.map_or_else(fail, |_| 0)
+    finish(result)
 }

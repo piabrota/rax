@@ -16,7 +16,7 @@ use prost_reflect::{DescriptorPool, Kind, MessageDescriptor};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
-use crate::v1alpha1::{FILE_DESCRIPTOR_SET, Model, Task, Workspace};
+use crate::v1alpha1::{FILE_DESCRIPTOR_SET, Gateway, Model, Task, Workspace};
 
 #[derive(Debug, thiserror::Error)]
 pub enum YamlError {
@@ -53,6 +53,10 @@ impl Manifest for Workspace {
             *mcp = serde_json::json!({ "servers": servers });
         }
     }
+}
+
+impl Manifest for Gateway {
+    const MESSAGE: &'static str = "ax.v1alpha1.Gateway";
 }
 
 impl Manifest for Model {
@@ -246,6 +250,7 @@ mod tests {
                 }),
                 debug: true,
                 config: None,
+                gateway: Some(GatewayRef { name: "gw".into() }),
             }),
             status: Some(TaskStatus {
                 phase: "Running".into(),
@@ -537,6 +542,90 @@ spec:
 
         // The earlier spec.workspaces list is no longer part of the schema.
         assert!(from_yaml::<Task>("kind: Task\nspec:\n  workspaces:\n    - name: code\n").is_err());
+    }
+
+    #[test]
+    fn gateway_round_trip() {
+        let gw: Gateway = from_yaml(
+            r#"
+apiVersion: ax.io/v1alpha1
+kind: Gateway
+metadata:
+  name: review-bot-gw
+  atespace: default
+spec:
+  egress:
+    - https:
+        hostnames: ["api.anthropic.com"]
+        effects:
+          replaceHeaders:
+            - header: x-api-key
+              credentialUri: "ate-secret://k8s.io/default/default/anthropic-creds/api-key"
+    - https:
+        hostnames: ["api.github.com"]
+        effects:
+          replaceHeaders:
+            - header: Authorization
+              prefix: "Bearer "
+              actorJwt:
+                audiences: ["https://api.github.com"]
+                expirationSeconds: 300
+    - http:
+        hostnames: ["mirror.example.com"]
+        ports:
+          numbers: [80, 8080]
+    - tlsPassthrough:
+        hostnames: ["db.example.com"]
+        ports:
+          all: {}
+"#,
+        )
+        .unwrap();
+        let egress = &gw.spec.as_ref().unwrap().egress;
+        assert_eq!(egress.len(), 4);
+        let headers = |i: usize| {
+            &egress[i]
+                .https
+                .as_ref()
+                .unwrap()
+                .effects
+                .as_ref()
+                .unwrap()
+                .replace_headers
+        };
+        assert_eq!(headers(0)[0].header, "x-api-key");
+        assert_eq!(
+            headers(0)[0].credential_uri,
+            "ate-secret://k8s.io/default/default/anthropic-creds/api-key"
+        );
+        assert_eq!(headers(1)[0].prefix, "Bearer ");
+        assert_eq!(
+            headers(1)[0].actor_jwt.as_ref().unwrap().expiration_seconds,
+            300
+        );
+        let ports = egress[2].http.as_ref().unwrap().ports.as_ref().unwrap();
+        assert_eq!(ports.numbers, [80, 8080]);
+        let ports = egress[3]
+            .tls_passthrough
+            .as_ref()
+            .unwrap()
+            .ports
+            .as_ref()
+            .unwrap();
+        assert!(ports.all.is_some());
+        let out = round_trip(&gw);
+        assert!(out.contains("tlsPassthrough:"), "{out}");
+    }
+
+    #[test]
+    fn task_gateway_binding() {
+        let task: Task = from_yaml(
+            "kind: Task\nmetadata:\n  name: bound\nspec:\n  gateway: {name: review-bot-gw}\n",
+        )
+        .unwrap();
+        let r = task.spec.as_ref().unwrap().gateway.as_ref().unwrap();
+        assert_eq!(r.name, "review-bot-gw");
+        round_trip(&task);
     }
 
     #[test]

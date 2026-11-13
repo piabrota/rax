@@ -1670,6 +1670,7 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-reflect",
+ "prost-types",
  "protox",
  "regex",
  "serde",
@@ -1702,11 +1703,17 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "chrono",
+ "http",
  "libc",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry-proto",
+ "opentelemetry_sdk",
  "pbjson-types",
  "rand 0.9.5",
  "rax-api",
  "rax-guest",
+ "rax-otelenv",
  "rax-server",
  "rax-store",
  "rax-substrate",
@@ -1721,7 +1728,9 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+ "tokio-stream",
  "tonic",
+ "tower",
  "x509-parser",
 ]
 
@@ -1748,6 +1757,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rax-otelenv"
+version = "0.1.0"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
+]
+
+[[package]]
 name = "rax-server"
 version = "0.1.0"
 dependencies = [
@@ -1769,6 +1787,7 @@ dependencies = [
  "pbjson-types",
  "prometheus",
  "rax-api",
+ "rax-otelenv",
  "rax-store",
  "rax-substrate",
  "rustls",

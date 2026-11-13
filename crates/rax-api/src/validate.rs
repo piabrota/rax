@@ -9,7 +9,8 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::v1alpha1::{Model, ObjectMeta, Task, TaskSpec, Workspace};
+use crate::substrate::ateapi::v1::{EgressRule, HttpRuleEffects, Ports};
+use crate::v1alpha1::{Gateway, Model, ObjectMeta, Task, TaskSpec, Workspace};
 
 /// A problem that makes a resource unusable, phrased for the person who wrote
 /// the manifest.
@@ -100,6 +101,106 @@ pub fn validate_model(m: &Model) -> Result<(), ValidationError> {
     validate_object_meta(m.metadata.as_ref())
 }
 
+/// Reports the first problem with a gateway that would make it unusable. The
+/// API server calls it before saving. Agent Substrate checks the rest of each
+/// egress rule later, when a task that binds the gateway is created.
+pub fn validate_gateway(g: &Gateway) -> Result<(), ValidationError> {
+    validate_object_meta(g.metadata.as_ref())?;
+    let rules = g.spec.as_ref().map_or(&[][..], |s| &s.egress[..]);
+    for (i, rule) in rules.iter().enumerate() {
+        // A rule kind added by a newer Substrate would skip the checks below.
+        let Some(RuleFields {
+            kind,
+            hostnames,
+            effects,
+            ports,
+        }) = egress_rule_fields(rule)
+        else {
+            return Err(ValidationError::new(format!(
+                "spec.egress[{i}]: exactly one of http, https, or tlsPassthrough is required"
+            )));
+        };
+        let field = format!("spec.egress[{i}].{kind}");
+        let credential = effects.is_some_and(|e| !e.replace_headers.is_empty());
+        if credential && kind == "http" {
+            return Err(ValidationError::new(format!(
+                "{field}.effects.replaceHeaders: not allowed on an http rule: the credential would be sent in cleartext"
+            )));
+        }
+        for (j, name) in hostnames.iter().enumerate() {
+            if let Some(reason) = denied_egress_hostname(name) {
+                return Err(ValidationError::new(format!(
+                    "{field}.hostnames[{j}]: {name:?} is not allowed: {reason}"
+                )));
+            }
+            if credential && name.starts_with("*.") {
+                return Err(ValidationError::new(format!(
+                    "{field}.effects.replaceHeaders: not allowed with wildcard hostname {name:?}: name each host that gets the credential"
+                )));
+            }
+        }
+        // Unlike http and https, passthrough has no default port.
+        if kind == "tlsPassthrough" && ports.is_none_or(|p| p.all.is_none() && p.numbers.is_empty())
+        {
+            return Err(ValidationError::new(format!(
+                "{field}.ports: required, set numbers or all"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The fields of an egress rule that the checks read.
+struct RuleFields<'a> {
+    /// The kind of rule that is set, named as in a manifest.
+    kind: &'static str,
+    hostnames: &'a [String],
+    effects: Option<&'a HttpRuleEffects>,
+    ports: Option<&'a Ports>,
+}
+
+/// The fields of the one kind of rule that is set, or `None` unless exactly
+/// one is.
+fn egress_rule_fields(rule: &EgressRule) -> Option<RuleFields<'_>> {
+    let (kind, hostnames, effects, ports) = match (&rule.http, &rule.https, &rule.tls_passthrough) {
+        (Some(r), None, None) => ("http", &r.hostnames, r.effects.as_ref(), r.ports.as_ref()),
+        (None, Some(r), None) => ("https", &r.hostnames, r.effects.as_ref(), r.ports.as_ref()),
+        (None, None, Some(r)) => ("tlsPassthrough", &r.hostnames, None, r.ports.as_ref()),
+        _ => return None,
+    };
+    Some(RuleFields {
+        kind,
+        hostnames,
+        effects,
+        ports,
+    })
+}
+
+/// Why a hostname is not allowed, or `None` if it is.
+fn denied_egress_hostname(name: &str) -> Option<&'static str> {
+    if name == "*" {
+        Some("it matches every host, including hosts inside the cluster")
+    } else if is_ip_address(name) {
+        Some("IP addresses cannot be used, name the host instead")
+    } else if name == "localhost" || name.ends_with(".localhost") {
+        Some("it would be the egress gateway's localhost; a task reaches its own without a rule")
+    } else {
+        None
+    }
+}
+
+/// Reports whether `name` is an IP address. As in Agent Substrate, a name whose
+/// last label is a number counts as one.
+fn is_ip_address(name: &str) -> bool {
+    // Go's netip.ParseAddr also takes an IPv6 zone, which Rust's parser does not.
+    let unzoned = name.split_once('%').map_or(name, |(addr, _)| addr);
+    if name.parse::<std::net::IpAddr>().is_ok() || unzoned.parse::<std::net::Ipv6Addr>().is_ok() {
+        return true;
+    }
+    let last = name.rsplit('.').next().unwrap_or("");
+    !last.is_empty() && last.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Reports the first problem with a task that would make it impossible to run
 /// correctly.
 pub fn validate_task(t: &Task) -> Result<(), ValidationError> {
@@ -115,6 +216,12 @@ pub fn validate_task(t: &Task) -> Result<(), ValidationError> {
                 r.path
             )));
         }
+    }
+    if spec
+        .and_then(|s| s.gateway.as_ref())
+        .is_some_and(|r| r.name.is_empty())
+    {
+        return Err(ValidationError::new("spec.gateway: name is required"));
     }
     if let Some(spec) = spec {
         validate_task_config(spec)?;
@@ -162,7 +269,7 @@ pub fn validate_task_config(spec: &TaskSpec) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v1alpha1::{EnvVar, File, WorkspaceRef, WorkspaceSpec};
+    use crate::v1alpha1::{EnvVar, File, GatewayRef, WorkspaceRef, WorkspaceSpec};
 
     fn meta(name: &str, atespace: &str) -> Option<ObjectMeta> {
         Some(ObjectMeta {
@@ -270,6 +377,159 @@ mod tests {
             })
             .is_err()
         );
+        assert!(
+            validate_gateway(&Gateway {
+                metadata: meta("Bad", ""),
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn gateways() {
+        use crate::substrate::ateapi::v1::{
+            AllPorts, CredentialHeader, HttpRule, HttpsRule, TlsPassthroughRule,
+        };
+        use crate::v1alpha1::GatewaySpec;
+        let names = |h: &[&str]| h.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let http = |effects: Option<HttpRuleEffects>, h: &[&str]| EgressRule {
+            http: Some(HttpRule {
+                hostnames: names(h),
+                effects,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let https = |effects: Option<HttpRuleEffects>, h: &[&str]| EgressRule {
+            https: Some(HttpsRule {
+                hostnames: names(h),
+                effects,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let passthrough = |ports: Option<Ports>, h: &[&str]| EgressRule {
+            tls_passthrough: Some(TlsPassthroughRule {
+                hostnames: names(h),
+                ports,
+            }),
+            ..Default::default()
+        };
+        let credential = || {
+            Some(HttpRuleEffects {
+                replace_headers: vec![CredentialHeader {
+                    header: "Authorization".into(),
+                    credential_uri: "ate-secret://k8s.io/default/default/token/value".into(),
+                    ..Default::default()
+                }],
+            })
+        };
+        let port443 = || {
+            Some(Ports {
+                numbers: vec![443],
+                ..Default::default()
+            })
+        };
+        let cases: Vec<(&str, EgressRule, &str)> = vec![
+            (
+                "host with a credential",
+                https(credential(), &["api.example.com"]),
+                "",
+            ),
+            ("subdomain wildcard", https(None, &["*.example.com"]), ""),
+            (
+                "passthrough with port numbers",
+                passthrough(port443(), &["db.example.com"]),
+                "",
+            ),
+            (
+                "passthrough with every port",
+                passthrough(
+                    Some(Ports {
+                        all: Some(AllPorts {}),
+                        ..Default::default()
+                    }),
+                    &["db.example.com"],
+                ),
+                "",
+            ),
+            (
+                "names that resemble denied ones",
+                https(None, &["notlocalhost", "1.example.com"]),
+                "",
+            ),
+            (
+                "every host",
+                https(None, &["*"]),
+                r#"spec.egress[0].https.hostnames[0]: "*" is not allowed: it matches every host"#,
+            ),
+            (
+                "subdomain wildcard with a credential",
+                https(credential(), &["*.example.com"]),
+                r#"spec.egress[0].https.effects.replaceHeaders: not allowed with wildcard hostname "*.example.com""#,
+            ),
+            (
+                "credential over http",
+                http(credential(), &["api.example.com"]),
+                "spec.egress[0].http.effects.replaceHeaders: not allowed on an http rule",
+            ),
+            (
+                "rule without a kind",
+                EgressRule::default(),
+                "spec.egress[0]: exactly one of http, https, or tlsPassthrough is required",
+            ),
+            (
+                "rule with two kinds",
+                EgressRule {
+                    https: https(None, &["example.com"]).https,
+                    ..http(None, &["example.com"])
+                },
+                "exactly one of http, https, or tlsPassthrough is required",
+            ),
+            (
+                "passthrough without ports",
+                passthrough(None, &["db.example.com"]),
+                "spec.egress[0].tlsPassthrough.ports: required",
+            ),
+            (
+                "passthrough to localhost",
+                passthrough(port443(), &["example.com", "localhost"]),
+                r#"spec.egress[0].tlsPassthrough.hostnames[1]: "localhost" is not allowed: it would be the egress gateway's localhost"#,
+            ),
+            (
+                "name under localhost",
+                http(None, &["app.localhost"]),
+                "it would be the egress gateway's localhost",
+            ),
+            (
+                "ipv6 address",
+                https(None, &["fd00::1"]),
+                r#"spec.egress[0].https.hostnames[0]: "fd00::1" is not allowed: IP addresses cannot be used"#,
+            ),
+            (
+                "ip address in short form",
+                https(None, &["127.1"]),
+                "IP addresses cannot be used",
+            ),
+        ];
+        for (name, rule, want) in cases {
+            let gw = Gateway {
+                metadata: meta("gw", ""),
+                spec: Some(GatewaySpec { egress: vec![rule] }),
+                ..Default::default()
+            };
+            match validate_gateway(&gw) {
+                Ok(()) => assert!(
+                    want.is_empty(),
+                    "{name}: expected error containing {want:?}"
+                ),
+                Err(e) => assert!(
+                    !want.is_empty() && e.to_string().contains(want),
+                    "{name}: {e}"
+                ),
+            }
+        }
     }
 
     #[test]
@@ -307,6 +567,22 @@ mod tests {
                     ..Default::default()
                 }),
                 "spec.workspace: name is required",
+            ),
+            (
+                "gateway",
+                Some(TaskSpec {
+                    gateway: Some(GatewayRef { name: "gw".into() }),
+                    ..Default::default()
+                }),
+                "",
+            ),
+            (
+                "nameless gateway",
+                Some(TaskSpec {
+                    gateway: Some(GatewayRef::default()),
+                    ..Default::default()
+                }),
+                "spec.gateway: name is required",
             ),
             (
                 "relative path",

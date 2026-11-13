@@ -17,13 +17,33 @@ pub mod v1alpha1 {
         include_bytes!(concat!(env!("OUT_DIR"), "/ax_descriptor.bin"));
 }
 
+pub mod substrate {
+    //! The messages of Agent Substrate's control API (`substrate.ateapi.v1`)
+    //! that AX's protos import: a Gateway's egress rules are Substrate's
+    //! `EgressRule`.
+    pub mod ateapi {
+        pub mod v1 {
+            #![allow(clippy::all)]
+            include!(concat!(
+                env!("OUT_DIR"),
+                "/substrate/substrate.ateapi.v1.rs"
+            ));
+            include!(concat!(
+                env!("OUT_DIR"),
+                "/substrate/substrate.ateapi.v1.serde.rs"
+            ));
+        }
+    }
+}
+
 pub use resources::{
     MAX_CPU_LIMIT_CORES, parse_cpu_millicores, parse_memory_bytes, validate_resources,
 };
 pub use validate::{
     DEFAULT_WORKSPACE_PATH, MAX_ENV_VALUE_SIZE, MAX_NAME_LENGTH, MAX_TASK_CONFIG_SIZE,
-    MAX_TASK_YAML_SIZE, ValidationError, validate_model, validate_name, validate_object_meta,
-    validate_task, validate_task_config, validate_task_size, validate_workspace,
+    MAX_TASK_YAML_SIZE, ValidationError, validate_gateway, validate_model, validate_name,
+    validate_object_meta, validate_task, validate_task_config, validate_task_size,
+    validate_workspace,
 };
 pub use yaml::{
     Manifest, YamlError, from_json_lenient, from_yaml, from_yaml_lenient, to_json, to_yaml,
@@ -33,6 +53,7 @@ pub const API_VERSION: &str = "ax.io/v1alpha1";
 pub const KIND_TASK: &str = "Task";
 pub const KIND_WORKSPACE: &str = "Workspace";
 pub const KIND_MODEL: &str = "Model";
+pub const KIND_GATEWAY: &str = "Gateway";
 
 pub const DEFAULT_TASK_IMAGE: &str = "gcr.io/ax-substrate/ate-images/ax-task-runner";
 pub const DEFAULT_SYSTEM_NAMESPACE: &str = "ax-system";

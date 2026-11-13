@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use rand::RngCore;
 use rax_api::Manifest;
-use rax_api::v1alpha1::{Model, Task, TaskStatus, Workspace};
+use rax_api::v1alpha1::{Gateway, Model, Task, TaskStatus, Workspace};
 use serde_json::Value;
 use tokio::sync::oneshot;
 use tokio_postgres::types::ToSql;
@@ -22,7 +22,7 @@ use tokio_postgres::{Config, NoTls};
 use crate::lock::{LockGuard, Locker, lock_key};
 use crate::{
     DEFAULT_TASK_LIST_LIMIT, ResourceStore, Result, StoreError, TaskStore, all_atespaces,
-    default_atespace, meta_key, prepare_model, prepare_task, prepare_workspace,
+    default_atespace, meta_key, prepare_gateway, prepare_model, prepare_task, prepare_workspace,
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
@@ -422,6 +422,23 @@ impl ResourceStore for PostgresStore {
         self.delete("workspaces", atespace, name).await
     }
 
+    async fn save_gateway(&self, gw: &mut Gateway) -> Result<()> {
+        prepare_gateway(gw)?;
+        self.save("gateways", meta_key(&gw.metadata), gw).await
+    }
+
+    async fn get_gateway(&self, atespace: &str, name: &str) -> Result<Gateway> {
+        self.get("gateways", atespace, name).await
+    }
+
+    async fn list_gateways(&self, atespace: &str) -> Result<Vec<Gateway>> {
+        self.list("gateways", atespace, 0, 0).await
+    }
+
+    async fn delete_gateway(&self, atespace: &str, name: &str) -> Result<()> {
+        self.delete("gateways", atespace, name).await
+    }
+
     async fn save_model(&self, model: &mut Model) -> Result<()> {
         prepare_model(model)?;
         self.save("models", meta_key(&model.metadata), model).await
@@ -500,7 +517,8 @@ mod tests {
             return None;
         };
         let s = PostgresStore::open(&url, opts).await.unwrap();
-        s.exec("TRUNCATE tasks, workspaces, models, locks").await;
+        s.exec("TRUNCATE tasks, workspaces, gateways, models, locks")
+            .await;
         Some(s)
     }
 
@@ -522,7 +540,8 @@ mod tests {
         let Some(s) = open(PostgresOptions::default()).await else {
             return;
         };
-        s.exec("DROP TABLE tasks, workspaces, models, locks").await;
+        s.exec("DROP TABLE tasks, workspaces, gateways, models, locks")
+            .await;
         // Simulate several replicas starting at once.
         let runs: Vec<_> = (0..4)
             .map(|_| {

@@ -665,6 +665,18 @@ impl ResourceStore for FailingStore {
     async fn delete_workspace(&self, a: &str, n: &str) -> rax_store::Result<()> {
         self.inner.delete_workspace(a, n).await
     }
+    async fn save_gateway(&self, g: &mut Gateway) -> rax_store::Result<()> {
+        self.inner.save_gateway(g).await
+    }
+    async fn get_gateway(&self, a: &str, n: &str) -> rax_store::Result<Gateway> {
+        self.inner.get_gateway(a, n).await
+    }
+    async fn list_gateways(&self, a: &str) -> rax_store::Result<Vec<Gateway>> {
+        self.inner.list_gateways(a).await
+    }
+    async fn delete_gateway(&self, a: &str, n: &str) -> rax_store::Result<()> {
+        self.inner.delete_gateway(a, n).await
+    }
     async fn save_model(&self, m: &mut Model) -> rax_store::Result<()> {
         self.inner.save_model(m).await
     }
@@ -1132,6 +1144,112 @@ async fn update_keeps_creation_time() {
         .create_time;
     assert!(first.is_some());
     assert_eq!(first, second);
+}
+
+/// Tasks are immutable, and gateway rules are not applied yet, so a task that
+/// binds a gateway is refused rather than saved with a binding nothing honors.
+#[tokio::test]
+async fn create_task_rejects_gateway_binding() {
+    let store = Arc::new(MemoryStore::new());
+    let svc = service(store.clone(), Default::default());
+    let mut req = new_task("bound", "img");
+    req.task.as_mut().unwrap().spec.as_mut().unwrap().gateway =
+        Some(GatewayRef { name: "gw".into() });
+    let err = svc.create_task(req).await.unwrap_err();
+    assert_eq!(err.code(), Code::Unimplemented, "{err}");
+    assert!(matches!(
+        store.get_task("default", "bound").await,
+        Err(StoreError::NotFound)
+    ));
+}
+
+#[tokio::test]
+async fn gateway_crud() {
+    let svc = service(Arc::new(MemoryStore::new()), Default::default());
+    let gw = |host: &str| Gateway {
+        metadata: meta("gw"),
+        spec: Some(GatewaySpec {
+            egress: vec![rax_api::substrate::ateapi::v1::EgressRule {
+                https: Some(rax_api::substrate::ateapi::v1::HttpsRule {
+                    hostnames: vec![host.into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        }),
+        ..Default::default()
+    };
+    let create = |g| CreateGatewayRequest { gateway: Some(g) };
+    let update = |g| UpdateGatewayRequest { gateway: Some(g) };
+
+    let err = svc
+        .update_gateway(update(gw("a.example.com")))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::NotFound, "{err}");
+    let first = svc
+        .create_gateway(create(gw("a.example.com")))
+        .await
+        .unwrap();
+    let meta_of = |g: &Gateway| g.metadata.clone().unwrap();
+    assert_eq!(meta_of(&first).atespace, "default");
+    assert_eq!(first.kind, rax_api::KIND_GATEWAY);
+    let err = svc
+        .create_gateway(create(gw("a.example.com")))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::AlreadyExists, "{err}");
+    assert_eq!(
+        err.message(),
+        r#"gateway "gw" already exists in atespace "default""#
+    );
+
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let second = svc
+        .update_gateway(update(gw("b.example.com")))
+        .await
+        .unwrap();
+    assert_eq!(meta_of(&first).create_time, meta_of(&second).create_time);
+    let got = svc
+        .get_gateway(GetGatewayRequest {
+            atespace: String::new(),
+            name: "gw".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(got, second);
+    let list = svc
+        .list_gateways(ListGatewaysRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(list.gateways, [second]);
+
+    let err = svc.create_gateway(create(gw("*"))).await.unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+    let err = svc
+        .create_gateway(CreateGatewayRequest { gateway: None })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+
+    svc.delete_gateway(DeleteGatewayRequest {
+        atespace: String::new(),
+        name: "gw".into(),
+    })
+    .await
+    .unwrap();
+    let err = svc
+        .get_gateway(GetGatewayRequest {
+            atespace: "default".into(),
+            name: "gw".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::NotFound, "{err}");
+    assert_eq!(
+        err.message(),
+        r#"gateway "gw" not found in atespace "default""#
+    );
 }
 
 #[tokio::test]

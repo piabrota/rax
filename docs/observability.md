@@ -84,6 +84,32 @@ Each instrument keeps at most 2000 attribute sets per collection (the SDK
 default); further sets are folded into one overflow series. `/metrics` also
 serves the process metrics (`process_*`); they are not pushed over OTLP.
 
+## CLI traces
+
+`rax --trace <command>` traces one command, as `ax --trace` does. The CLI
+prints the trace ID to stderr, and every AX RPC of the command sends a
+sampled W3C `traceparent` (never baggage). Each RPC is a client span under
+the command span, named `ax.v1alpha1.AX/<Method>`, and resolving the server
+address, which can start a port-forward, is a child span too. Without
+`--trace`, the CLI creates no tracer and sends no trace context, so the
+server's own sampler decides for CLI traffic.
+
+The CLI exports its spans over OTLP/gRPC only when
+`OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is set
+in your shell. This is unlike rax-server, which exports by default and uses
+the SDK default `localhost:4317` when no endpoint is set. The spans have
+`service.name=rax`. `OTEL_TRACES_EXPORTER`, `OTEL_SERVICE_NAME` and
+`OTEL_RESOURCE_ATTRIBUTES` follow the same rules as for rax-server; both
+take them from the `rax-otelenv` crate.
+
+The CLI exports once, when the command ends, and waits at most 2 seconds
+(200 ms when Ctrl-C pressed twice leaves `rax ssh`). It does not retry. If
+the export fails, the CLI prints a warning that names the endpoint and gives
+the error.
+
+Like ax-server, rax-server does not read `traceparent` yet, so for now the
+trace has only the CLI spans.
+
 ## Attribute names
 
 Spans, events and log attributes use the names in

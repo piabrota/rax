@@ -24,6 +24,7 @@ tonic.workspace = true
 tonic-prost.workspace = true
 
 [build-dependencies]
+prost-types.workspace = true
 prost.workspace = true
 pbjson-build.workspace = true
 prost-build.workspace = true

@@ -24,9 +24,8 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
-use opentelemetry_sdk::resource::{EnvResourceDetector, TelemetryResourceDetector};
 use opentelemetry_sdk::trace::SdkTracerProvider;
-use opentelemetry_semantic_conventions::resource::{SERVICE_INSTANCE_ID, SERVICE_NAME};
+use opentelemetry_semantic_conventions::resource::SERVICE_INSTANCE_ID;
 
 pub use config::{
     EXPORTER_CONSOLE, EXPORTER_NONE, EXPORTER_OTLP, EXPORTER_PROMETHEUS, Exporters, SamplerSpec,
@@ -158,23 +157,9 @@ impl Providers {
 /// override the defaults; the bundled manifests set `service.instance.id` to
 /// the pod UID and add the `k8s.*` attributes there.
 fn new_resource(service_name: &str) -> Resource {
-    let mut b = Resource::builder_empty()
-        .with_detector(Box::new(TelemetryResourceDetector))
-        .with_schema_url(
-            [KeyValue::new(SERVICE_NAME, service_name.to_string())],
-            opentelemetry_semantic_conventions::SCHEMA_URL,
-        );
     // Without OTEL_RESOURCE_ATTRIBUTES, the hostname tells replicas apart.
-    if let Some(host) = hostname() {
-        b = b.with_attribute(KeyValue::new(SERVICE_INSTANCE_ID, host));
-    }
-    b = b.with_detector(Box::new(EnvResourceDetector::new()));
-    if let Ok(name) = std::env::var("OTEL_SERVICE_NAME")
-        && !name.is_empty()
-    {
-        b = b.with_attribute(KeyValue::new(SERVICE_NAME, name));
-    }
-    b.build()
+    let host = hostname().map(|h| KeyValue::new(SERVICE_INSTANCE_ID, h));
+    rax_otelenv::resource(service_name, host)
 }
 
 fn hostname() -> Option<String> {

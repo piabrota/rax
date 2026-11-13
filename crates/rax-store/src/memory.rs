@@ -5,11 +5,11 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use rax_api::v1alpha1::{Model, Task, TaskStatus, Workspace};
+use rax_api::v1alpha1::{Gateway, Model, Task, TaskStatus, Workspace};
 
 use crate::{
     DEFAULT_TASK_LIST_LIMIT, ResourceStore, Result, StoreError, TaskStore, all_atespaces,
-    default_atespace, meta_key, prepare_model, prepare_task, prepare_workspace,
+    default_atespace, meta_key, prepare_gateway, prepare_model, prepare_task, prepare_workspace,
 };
 
 type Key = (String, String);
@@ -65,6 +65,7 @@ struct State {
     seq: u64,
     tasks: Table<Task>,
     workspaces: Table<Workspace>,
+    gateways: Table<Gateway>,
     models: Table<Model>,
 }
 
@@ -159,6 +160,29 @@ impl ResourceStore for MemoryStore {
 
     async fn delete_workspace(&self, atespace: &str, name: &str) -> Result<()> {
         self.with(|s| s.workspaces.delete(atespace, name));
+        Ok(())
+    }
+
+    async fn save_gateway(&self, gw: &mut Gateway) -> Result<()> {
+        prepare_gateway(gw)?;
+        let key = meta_key(&gw.metadata);
+        self.with(|s| {
+            let seq = s.next_seq();
+            s.gateways.rows.insert(key, (seq, gw.clone()));
+        });
+        Ok(())
+    }
+
+    async fn get_gateway(&self, atespace: &str, name: &str) -> Result<Gateway> {
+        self.with(|s| s.gateways.get(atespace, name))
+    }
+
+    async fn list_gateways(&self, atespace: &str) -> Result<Vec<Gateway>> {
+        Ok(self.with(|s| s.gateways.list(atespace, 0, 0)))
+    }
+
+    async fn delete_gateway(&self, atespace: &str, name: &str) -> Result<()> {
+        self.with(|s| s.gateways.delete(atespace, name));
         Ok(())
     }
 

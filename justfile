@@ -21,8 +21,8 @@ buf := "npx --yes @bufbuild/buf@1.75.0"
 
 # Check that AX's protos are formatted and pass buf lint, as AX's `make generate` does. Needs Node.js.
 proto-lint:
-    {{buf}} format --diff --exit-code
-    {{buf}} lint
+    {{buf}} format --diff --exit-code --path proto/pkg/apis
+    {{buf}} lint --path proto/pkg/apis
 
 # Build the rax-server image (the one `deploy` pushes to the local cluster).
 image tag="rax-server:local":

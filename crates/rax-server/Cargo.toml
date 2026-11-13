@@ -22,6 +22,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 pbjson-types.workspace = true
 rax-api.workspace = true
+rax-otelenv.workspace = true
 rax-store.workspace = true
 rax-substrate.workspace = true
 rustls.workspace = true

@@ -4,7 +4,9 @@ use std::future::Future;
 use std::sync::Arc;
 
 use rax_api::phase;
-use rax_api::v1alpha1::{self as api, ObjectMeta, Task, TaskStatus, Workspace, ax_server::Ax};
+use rax_api::v1alpha1::{
+    self as api, Gateway, ObjectMeta, Task, TaskStatus, Workspace, ax_server::Ax,
+};
 use rax_store::{DEFAULT_ATESPACE, Locker, MemoryLocker, ResourceStore, Store, StoreError};
 use tonic::{Request, Response, Status};
 
@@ -120,6 +122,11 @@ impl AxService {
             .task
             .ok_or_else(|| Status::invalid_argument("task required"))?;
         rax_api::validate_task(&task).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        // Tasks are immutable, so a task saved now would keep a gateway binding
+        // that nothing applies. Accept it once gateway rules are enforced.
+        if task.spec.as_ref().is_some_and(|s| s.gateway.is_some()) {
+            return Err(Status::unimplemented("spec.gateway is not supported yet"));
+        }
         let meta = task.metadata.get_or_insert_with(Default::default);
         if meta.atespace.is_empty() {
             meta.atespace = DEFAULT_ATESPACE.into();
@@ -420,6 +427,90 @@ impl AxService {
         .await
     }
 
+    // --- Gateways ---
+
+    pub async fn get_gateway(&self, req: api::GetGatewayRequest) -> Result<Gateway, Status> {
+        let atespace = atespace_or_default(&req.atespace);
+        self.resources
+            .get_gateway(&atespace, &req.name)
+            .await
+            .map_err(read_error("gateway", &req.name, &atespace))
+    }
+
+    pub async fn list_gateways(
+        &self,
+        req: api::ListGatewaysRequest,
+    ) -> Result<api::ListGatewaysResponse, Status> {
+        let gateways = self
+            .resources
+            .list_gateways(&req.atespace)
+            .await
+            .map_err(internal("listing gateways"))?;
+        Ok(api::ListGatewaysResponse { gateways })
+    }
+
+    pub async fn create_gateway(&self, req: api::CreateGatewayRequest) -> Result<Gateway, Status> {
+        let gw = req
+            .gateway
+            .ok_or_else(|| Status::invalid_argument("gateway required"))?;
+        self.save_gateway(gw, true).await
+    }
+
+    pub async fn update_gateway(&self, req: api::UpdateGatewayRequest) -> Result<Gateway, Status> {
+        let gw = req
+            .gateway
+            .ok_or_else(|| Status::invalid_argument("gateway required"))?;
+        self.save_gateway(gw, false).await
+    }
+
+    /// Validates and saves a gateway, which must be new when `create` is set
+    /// and must exist otherwise.
+    async fn save_gateway(&self, mut gw: Gateway, create: bool) -> Result<Gateway, Status> {
+        rax_api::validate_gateway(&gw).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let meta = gw.metadata.as_ref();
+        let atespace = atespace_or_default(meta.map_or("", |m| m.atespace.as_str()));
+        let name = meta.map(|m| m.name.clone()).unwrap_or_default();
+        self.locked("gateway", &atespace, &name, async {
+            let existing = match self.resources.get_gateway(&atespace, &name).await {
+                Ok(g) => Some(g),
+                Err(StoreError::NotFound) => None,
+                Err(e) => return Err(Status::internal(format!("getting gateway: {e}"))),
+            };
+            match (create, &existing) {
+                (true, Some(_)) => {
+                    return Err(Status::already_exists(format!(
+                        "gateway {name:?} already exists in atespace {atespace:?}"
+                    )));
+                }
+                (false, None) => return Err(not_found("gateway", &name, &atespace)),
+                _ => {}
+            }
+            let prev = existing.and_then(|g| g.metadata);
+            gw.metadata = Some(default_metadata(gw.metadata.take(), |_, _| async { prev }).await);
+            self.resources
+                .save_gateway(&mut gw)
+                .await
+                .map_err(internal("saving gateway"))?;
+            Ok(gw)
+        })
+        .await
+    }
+
+    pub async fn delete_gateway(
+        &self,
+        req: api::DeleteGatewayRequest,
+    ) -> Result<api::DeleteGatewayResponse, Status> {
+        let atespace = atespace_or_default(&req.atespace);
+        self.locked("gateway", &atespace, &req.name, async {
+            self.resources
+                .delete_gateway(&atespace, &req.name)
+                .await
+                .map_err(internal("deleting gateway"))?;
+            Ok(api::DeleteGatewayResponse {})
+        })
+        .await
+    }
+
     // --- Models ---
 
     pub async fn get_model(&self, req: api::GetModelRequest) -> Result<api::Model, Status> {
@@ -573,6 +664,36 @@ impl Ax for AxService {
         self.delete_workspace(r.into_inner())
             .await
             .map(Response::new)
+    }
+    async fn get_gateway(
+        &self,
+        r: Request<api::GetGatewayRequest>,
+    ) -> Result<Response<Gateway>, Status> {
+        self.get_gateway(r.into_inner()).await.map(Response::new)
+    }
+    async fn list_gateways(
+        &self,
+        r: Request<api::ListGatewaysRequest>,
+    ) -> Result<Response<api::ListGatewaysResponse>, Status> {
+        self.list_gateways(r.into_inner()).await.map(Response::new)
+    }
+    async fn create_gateway(
+        &self,
+        r: Request<api::CreateGatewayRequest>,
+    ) -> Result<Response<Gateway>, Status> {
+        self.create_gateway(r.into_inner()).await.map(Response::new)
+    }
+    async fn update_gateway(
+        &self,
+        r: Request<api::UpdateGatewayRequest>,
+    ) -> Result<Response<Gateway>, Status> {
+        self.update_gateway(r.into_inner()).await.map(Response::new)
+    }
+    async fn delete_gateway(
+        &self,
+        r: Request<api::DeleteGatewayRequest>,
+    ) -> Result<Response<api::DeleteGatewayResponse>, Status> {
+        self.delete_gateway(r.into_inner()).await.map(Response::new)
     }
     async fn get_model(
         &self,

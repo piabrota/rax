@@ -14,6 +14,8 @@ pub struct GlobalArgs {
     pub server: String,
     pub kube_context: String,
     pub namespace: String,
+    /// `--trace`: trace the command.
+    pub trace: bool,
 }
 
 impl Default for GlobalArgs {
@@ -26,6 +28,7 @@ impl Default for GlobalArgs {
             server: String::new(),
             kube_context: String::new(),
             namespace: rax_api::DEFAULT_SYSTEM_NAMESPACE.into(),
+            trace: false,
         }
     }
 }
@@ -78,6 +81,8 @@ fn parse_global_args_with_env(args: &[String], env_namespace: Option<&str>) -> G
             value(&mut g.namespace);
         } else if let Some(v) = arg.strip_prefix("--namespace=") {
             g.namespace = v.into();
+        } else if arg == "--trace" {
+            g.trace = true;
         } else if g.cmd.is_empty() && !arg.starts_with('-') {
             g.cmd = arg.into();
         } else {
@@ -233,6 +238,23 @@ mod tests {
                     args: v(&["task123", "--", "cmd", "--context=x"]),
                     atespace: "team".into(),
                     atespace_explicit: true,
+                    ..base()
+                },
+            ),
+            (
+                v(&["get", "--trace", "tasks"]),
+                GlobalArgs {
+                    cmd: "get".into(),
+                    args: v(&["tasks"]),
+                    trace: true,
+                    ..base()
+                },
+            ),
+            (
+                v(&["ssh", "t", "--", "cmd", "--trace"]),
+                GlobalArgs {
+                    cmd: "ssh".into(),
+                    args: v(&["t", "--", "cmd", "--trace"]),
                     ..base()
                 },
             ),
