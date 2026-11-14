@@ -3,9 +3,10 @@
 use std::time::Duration;
 
 use rax_api::v1alpha1::{
-    Condition, ObjectMeta, ResourceList, ResourcesSpec, Task, TaskSpec, TaskStatus,
+    Condition, ObjectMeta, Profile, ResourceList, ResourcesSpec, Task, TaskSpec, TaskState,
+    TaskStatus,
 };
-use rax_api::{API_VERSION, DEFAULT_TASK_IMAGE, KIND_TASK, phase, reason};
+use rax_api::{API_VERSION, DEFAULT_TASK_IMAGE, KIND_TASK, reason};
 use rax_server::controller::{ControllerOptions, SubstrateActors, TaskReconciler};
 use rax_server::{ActorState, Actors, Reconciler};
 use rax_substrate::ateapi::{
@@ -32,7 +33,7 @@ async fn setup(default_task_image: &str) -> (FakeSubstrate, TaskReconciler) {
     (fake, r)
 }
 
-fn task(name: &str, image: &str, status_phase: Option<&str>) -> Task {
+fn task(name: &str, image: &str) -> Task {
     Task {
         api_version: API_VERSION.into(),
         kind: KIND_TASK.into(),
@@ -42,14 +43,21 @@ fn task(name: &str, image: &str, status_phase: Option<&str>) -> Task {
             ..Default::default()
         }),
         spec: Some(TaskSpec {
-            image: image.into(),
+            profile: Some(Profile {
+                image: image.into(),
+                ..Default::default()
+            }),
             ..Default::default()
         }),
-        status: status_phase.map(|p| TaskStatus {
-            phase: p.into(),
-            ..Default::default()
-        }),
+        status: None,
     }
+}
+
+/// A task named `atespace/name`, as delete takes it.
+fn named(atespace: &str, name: &str) -> Task {
+    let mut t = task(name, "img");
+    t.metadata.as_mut().unwrap().atespace = atespace.into();
+    t
 }
 
 fn status(t: &Task) -> &TaskStatus {
@@ -77,15 +85,26 @@ fn assert_condition(t: &Task, kind: &str, want_status: &str, want_reason: &str) 
 #[tokio::test]
 async fn provisions_and_resumes_a_running_task() {
     let (fake, r) = setup("").await;
-    let mut t = task("test-task", "ghrc.io/my-org/my-image", Some(phase::RUNNING));
-    t.spec.as_mut().unwrap().command = vec!["/bin/task-runner".into()];
+    let mut t = task("test-task", "ghrc.io/my-org/my-image");
+    t.spec.as_mut().unwrap().commands = vec!["/bin/task-runner".into()];
+    // A client-supplied actor name is ignored: the actor is always named
+    // after the task.
+    t.status = Some(TaskStatus {
+        actor: "not-the-task".into(),
+        ..Default::default()
+    });
 
-    r.resume(&mut t, None).await.unwrap();
+    r.resume(&mut t, None, None).await.unwrap();
     let got = t;
     let st = status(&got);
-    // The phase, actor and worker are the server's to read from the actor.
-    assert_eq!(st.phase, phase::RUNNING, "left as the caller set it");
-    assert!(st.id.starts_with("task-test-task-"), "{}", st.id);
+    // The state is the server's to read from the actor.
+    assert_eq!(st.state(), TaskState::Unspecified);
+    assert_eq!(st.resolved_argv, ["/bin/task-runner"]);
+    assert!(
+        st.ate_actor_template.starts_with("test-task-tmpl-"),
+        "{}",
+        st.ate_actor_template
+    );
     assert_condition(&got, "WorkspaceReady", "False", reason::INITIALIZING);
     assert!(
         condition(&got, "WorkspaceReady")
@@ -123,9 +142,8 @@ async fn defaults_the_task_image() {
         ),
     ] {
         let (fake, r) = setup(over).await;
-        let mut got = task("no-image", "", None);
-        r.resume(&mut got, None).await.unwrap();
-        assert_eq!(got.spec.unwrap().image, want);
+        let mut got = task("no-image", "");
+        r.resume(&mut got, None, None).await.unwrap();
         let images: Vec<_> = fake
             .state()
             .created_templates
@@ -139,9 +157,9 @@ async fn defaults_the_task_image() {
 #[tokio::test]
 async fn new_tasks_are_suspended() {
     let (fake, r) = setup("").await;
-    let mut got = task("suspend-task", "img", None);
-    r.suspend(&mut got, None).await.unwrap();
-    assert_eq!(status(&got).phase, "", "the phase is the caller's to set");
+    let mut got = task("suspend-task", "img");
+    r.suspend(&mut got, None, None).await.unwrap();
+    assert_eq!(status(&got).state(), TaskState::Unspecified);
     assert_eq!(
         fake.state().calls_of("SuspendActor"),
         ["default/suspend-task"]
@@ -155,21 +173,18 @@ async fn a_failed_suspend_keeps_the_status() {
         "SuspendActor",
         (0..10).map(|_| Status::unavailable("substrate unavailable")),
     );
-    let mut t = task("suspend-fail-task", "img", Some(phase::SUSPENDED));
-    let st = t.status.as_mut().unwrap();
-    st.worker_ip = "10.1.1.1".into();
+    let mut t = task("suspend-fail-task", "img");
+    let st = t.status.get_or_insert_default();
     st.conditions.push(Condition {
         r#type: "Ready".into(),
         status: "True".into(),
         reason: reason::TASK_RUNNING.into(),
         ..Default::default()
     });
-    let err = r.suspend(&mut t, None).await.unwrap_err();
+    let before = t.status.clone();
+    let err = r.suspend(&mut t, None, None).await.unwrap_err();
     assert_eq!(err.code(), Code::Unavailable);
-    let got = t;
-    assert_eq!(status(&got).phase, phase::SUSPENDED);
-    assert_eq!(status(&got).worker_ip, "10.1.1.1");
-    assert_condition(&got, "Ready", "True", reason::TASK_RUNNING);
+    assert_eq!(t.status, before, "a failed suspend restores the status");
 }
 
 #[tokio::test]
@@ -178,13 +193,9 @@ async fn a_rejected_template_fails_the_task_with_substrates_message() {
     let (fake, r) = setup("").await;
     fake.state()
         .fail("CreateActorTemplate", [Status::invalid_argument(MSG)]);
-    let mut t = task(
-        "tagged-image",
-        "localhost:5001/my-agent:v1",
-        Some(phase::RUNNING),
-    );
-    t.spec.as_mut().unwrap().command = vec!["python3".into(), "/app/agent.py".into()];
-    let err = r.resume(&mut t, None).await.unwrap_err();
+    let mut t = task("tagged-image", "localhost:5001/my-agent:v1");
+    t.spec.as_mut().unwrap().commands = vec!["python3".into(), "/app/agent.py".into()];
+    let err = r.resume(&mut t, None, None).await.unwrap_err();
     assert!(
         err.message().contains("must be pinned by digest"),
         "{}",
@@ -211,8 +222,8 @@ async fn a_transient_template_failure_leaves_the_task_pending() {
             "substrate control plane timed out",
         )],
     );
-    let mut got = task("template-transient", "img@sha256:00", None);
-    let err = r.resume(&mut got, None).await.unwrap_err();
+    let mut got = task("template-transient", "img@sha256:00");
+    let err = r.resume(&mut got, None, None).await.unwrap_err();
     assert_eq!(err.code(), Code::DeadlineExceeded);
     assert_condition(&got, "Ready", "False", reason::SUBSTRATE_UNAVAILABLE);
     assert!(fake.state().calls_of("CreateActor").is_empty());
@@ -239,18 +250,18 @@ async fn ready_server() -> String {
 async fn workspace_readiness_is_polled_until_it_is_set_up() {
     let (fake, r) = setup("").await;
     let ready = ready_server().await;
-    let t = task("ready-task", "", None);
+    let t = task("ready-task", "");
     fake.state().worker_ip = "127.0.0.1:1".into();
 
     // The worker does not answer: still initializing.
     let mut got = t.clone();
-    r.resume(&mut got, None).await.unwrap();
+    r.resume(&mut got, None, None).await.unwrap();
     assert_condition(&got, "WorkspaceReady", "False", reason::INITIALIZING);
 
     // It answers: set up.
     fake.state().worker_ip = ready.clone();
     let mut got = t;
-    r.resume(&mut got, None).await.unwrap();
+    r.resume(&mut got, None, None).await.unwrap();
     assert_condition(&got, "WorkspaceReady", "True", reason::SETUP_COMPLETE);
     assert_eq!(
         condition(&got, "WorkspaceReady").message,
@@ -258,12 +269,12 @@ async fn workspace_readiness_is_polled_until_it_is_set_up() {
     );
 
     // Suspending keeps WorkspaceReady.
-    r.suspend(&mut got, None).await.unwrap();
+    r.suspend(&mut got, None, None).await.unwrap();
     assert_condition(&got, "WorkspaceReady", "True", reason::SETUP_COMPLETE);
 
     // Resuming onto an unreachable worker trusts the recorded readiness.
     fake.state().worker_ip = "127.0.0.1:1".into();
-    r.resume(&mut got, None).await.unwrap();
+    r.resume(&mut got, None, None).await.unwrap();
     assert_condition(&got, "WorkspaceReady", "True", reason::SETUP_COMPLETE);
     assert_eq!(
         fake.state().templates.len(),
@@ -272,8 +283,8 @@ async fn workspace_readiness_is_polled_until_it_is_set_up() {
     );
 
     // A launch configuration change gets its own template.
-    got.spec.as_mut().unwrap().command = vec!["python3".into(), "agent.py".into()];
-    r.resume(&mut got, None).await.unwrap();
+    got.spec.as_mut().unwrap().commands = vec!["python3".into(), "agent.py".into()];
+    r.resume(&mut got, None, None).await.unwrap();
     assert_eq!(fake.state().templates.len(), 2);
 }
 
@@ -291,8 +302,8 @@ async fn readiness_is_also_probed_through_the_router() {
         },
     );
     fake.state().worker_ip = "127.0.0.1:1".into();
-    let mut got = task("routed", "img", None);
-    r.resume(&mut got, None).await.unwrap();
+    let mut got = task("routed", "img");
+    r.resume(&mut got, None, None).await.unwrap();
     assert_condition(&got, "WorkspaceReady", "True", reason::SETUP_COMPLETE);
 }
 
@@ -306,12 +317,11 @@ fn limits(cpu: i64, memory: i64) -> Option<ResourceRequirements> {
 }
 
 fn with_limits(mut t: Task, cpu: &str, memory: &str) -> Task {
-    t.spec.as_mut().unwrap().resources = Some(ResourcesSpec {
+    t.spec.as_mut().unwrap().profile.as_mut().unwrap().resources = Some(ResourcesSpec {
         limits: Some(ResourceList {
             cpu: cpu.into(),
             memory: memory.into(),
         }),
-        ..Default::default()
     });
     t
 }
@@ -319,8 +329,8 @@ fn with_limits(mut t: Task, cpu: &str, memory: &str) -> Task {
 #[tokio::test]
 async fn resource_limits_go_on_the_template() {
     let (fake, r) = setup("").await;
-    let t = with_limits(task("sized-task", "img", None), "2", "4Gi");
-    r.suspend(&mut t.clone(), None).await.unwrap();
+    let t = with_limits(task("sized-task", "img"), "2", "4Gi");
+    r.suspend(&mut t.clone(), None, None).await.unwrap();
     assert_eq!(
         fake.state().created_templates[0].resources,
         limits(2000, 4 << 30)
@@ -328,7 +338,7 @@ async fn resource_limits_go_on_the_template() {
 
     // A new limit is a new launch configuration, so a new template.
     let mut t = with_limits(t, "2", "8Gi");
-    r.suspend(&mut t, None).await.unwrap();
+    r.suspend(&mut t, None, None).await.unwrap();
     {
         let s = fake.state();
         assert_eq!(s.created_templates.len(), 2);
@@ -337,7 +347,7 @@ async fn resource_limits_go_on_the_template() {
         assert_eq!(s.created_templates[1].resources, limits(2000, 8 << 30));
     }
 
-    r.suspend(&mut task("plain-task", "img", None), None)
+    r.suspend(&mut task("plain-task", "img"), None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -355,44 +365,30 @@ async fn invalid_limits_fail_before_provisioning() {
                 cpu: "two".into(),
                 ..Default::default()
             }),
-            ..Default::default()
         },
         ResourcesSpec {
             limits: Some(ResourceList {
                 cpu: "0".into(),
                 ..Default::default()
             }),
-            ..Default::default()
         },
         ResourcesSpec {
             limits: Some(ResourceList {
                 cpu: "1000".into(),
                 ..Default::default()
             }),
-            ..Default::default()
         },
         ResourcesSpec {
             limits: Some(ResourceList {
                 memory: "-4Gi".into(),
                 ..Default::default()
             }),
-            ..Default::default()
-        },
-        ResourcesSpec {
-            requests: Some(ResourceList {
-                cpu: "500m".into(),
-                ..Default::default()
-            }),
-            limits: Some(ResourceList {
-                cpu: "2".into(),
-                ..Default::default()
-            }),
         },
     ];
     for reqs in bad {
-        let mut t = task("bad-limits", "img", None);
-        t.spec.as_mut().unwrap().resources = Some(reqs.clone());
-        let err = r.resume(&mut t, None).await.unwrap_err();
+        let mut t = task("bad-limits", "img");
+        t.spec.as_mut().unwrap().profile.as_mut().unwrap().resources = Some(reqs.clone());
+        let err = r.resume(&mut t, None, None).await.unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument, "{reqs:?}");
         assert_condition(&t, "Ready", "False", reason::INVALID_RESOURCES);
     }
@@ -408,11 +404,11 @@ async fn rejected_templates_never_fall_back() {
             "CreateActorTemplate",
             [Status::invalid_argument("rejected")],
         );
-        let mut t = task("rejected", "img", None);
+        let mut t = task("rejected", "img");
         if with {
             t = with_limits(t, "2", "4Gi");
         }
-        r.suspend(&mut t, None).await.unwrap_err();
+        r.suspend(&mut t, None, None).await.unwrap_err();
         assert_condition(&t, "Ready", "False", reason::TEMPLATE_CREATION_FAILED);
         assert!(fake.state().calls_of("CreateActor").is_empty());
     }
@@ -446,7 +442,7 @@ async fn delete_removes_the_actor_and_its_templates_only() {
                 .insert(format!("default/{name}"), template(name));
         }
     }
-    r.delete("default", "job").await.unwrap();
+    r.delete(&named("default", "job")).await.unwrap();
     let s = fake.state();
     assert_eq!(s.calls_of("DeleteActor"), ["default/job"]);
     assert_eq!(
@@ -470,7 +466,7 @@ async fn delete_waits_for_the_actor_to_go() {
     fake.state()
         .put_actor("default", "slow", ateapi::ActorState::Running);
     fake.state().deleting_polls = 2;
-    r.delete("", "slow").await.unwrap();
+    r.delete(&named("", "slow")).await.unwrap();
     assert!(fake.state().calls_of("GetActor").len() >= 3);
     assert!(fake.state().actors.is_empty());
 }
@@ -486,7 +482,7 @@ async fn delete_gives_up_on_an_actor_that_stays() {
     fake.state()
         .put_actor("default", "stuck", ateapi::ActorState::Running);
     fake.state().deleting_polls = usize::MAX;
-    let err = r.delete("default", "stuck").await.unwrap_err();
+    let err = r.delete(&named("default", "stuck")).await.unwrap_err();
     assert_eq!(err.code(), Code::DeadlineExceeded);
     assert!(
         err.message().contains("context deadline exceeded"),
@@ -507,22 +503,22 @@ async fn transient_failures_leave_tasks_pending_and_recover() {
 
     fake.state()
         .fail("CreateAtespace", [Status::deadline_exceeded("timed out")]);
-    let mut t = task("transient-atespace", "img", None);
-    let e = r.suspend(&mut t, None).await.unwrap_err();
+    let mut t = task("transient-atespace", "img");
+    let e = r.suspend(&mut t, None, None).await.unwrap_err();
     pending(&t, e);
 
     fake.state()
         .fail("CreateActor", [Status::deadline_exceeded("timed out")]);
-    let mut t = task("transient-actor", "img", None);
-    let e = r.suspend(&mut t, None).await.unwrap_err();
+    let mut t = task("transient-actor", "img");
+    let e = r.suspend(&mut t, None, None).await.unwrap_err();
     pending(&t, e);
 
     fake.state()
         .fail("ResumeActor", [Status::deadline_exceeded("unreachable")]);
-    let mut t = task("transient-resume", "img", None);
-    let e = r.resume(&mut t, None).await.unwrap_err();
+    let mut t = task("transient-resume", "img");
+    let e = r.resume(&mut t, None, None).await.unwrap_err();
     pending(&t, e);
-    r.resume(&mut t, None).await.unwrap();
+    r.resume(&mut t, None, None).await.unwrap();
     assert_eq!(
         fake.state().actor_state("default", "transient-resume"),
         Some(ateapi::ActorState::Running)
@@ -532,8 +528,8 @@ async fn transient_failures_leave_tasks_pending_and_recover() {
         "CreateActor",
         [Status::invalid_argument("invalid actor specification")],
     );
-    let mut t = task("permanent", "img", None);
-    let e = r.suspend(&mut t, None).await.unwrap_err();
+    let mut t = task("permanent", "img");
+    let e = r.suspend(&mut t, None, None).await.unwrap_err();
     assert!(!rax_server::is_transient(&e));
     assert_condition(&t, "Ready", "False", reason::ACTOR_CREATION_FAILED);
 }
@@ -607,13 +603,15 @@ async fn the_service_drives_task_lifecycles_through_substrate() {
     );
     let key = || ("default".to_owned(), "life".to_owned());
 
-    let mut t = task("life", "img", None);
+    let mut t = task("life", "img");
     t.metadata.as_mut().unwrap().atespace.clear();
     let created = svc
         .create_task(CreateTaskRequest { task: Some(t) })
         .await
         .unwrap();
-    assert_eq!(status(&created).phase, phase::SUSPENDED);
+    assert_eq!(status(&created).state(), TaskState::Suspended);
+    assert_eq!(status(&created).attempt, 1);
+    assert!(!created.metadata.as_ref().unwrap().uid.is_empty());
     assert_eq!(
         fake.state().actor_state("default", "life"),
         Some(ateapi::ActorState::Suspended)
@@ -624,15 +622,18 @@ async fn the_service_drives_task_lifecycles_through_substrate() {
         .resume_task(ResumeTaskRequest { atespace, name })
         .await
         .unwrap();
-    assert_eq!(status(&resumed).phase, phase::RUNNING);
-    assert_eq!(status(&resumed).worker_ip, ready);
+    assert_eq!(status(&resumed).state(), TaskState::Working);
     let (atespace, name) = key();
     let got = svc
         .get_task(GetTaskRequest { atespace, name })
         .await
         .unwrap();
-    assert_eq!(status(&got).phase, phase::RUNNING, "read from the actor");
-    assert_eq!(status(&got).worker_ip, ready);
+    assert_eq!(
+        status(&got).state(),
+        TaskState::Working,
+        "read from the actor"
+    );
+    assert_eq!(status(&got).actor_uid, "uid-default/life");
     assert_condition(&got, "WorkspaceReady", "True", reason::SETUP_COMPLETE);
 
     let (atespace, name) = key();
@@ -640,7 +641,7 @@ async fn the_service_drives_task_lifecycles_through_substrate() {
         .suspend_task(SuspendTaskRequest { atespace, name })
         .await
         .unwrap();
-    assert_eq!(status(&suspended).phase, phase::SUSPENDED);
+    assert_eq!(status(&suspended).state(), TaskState::Suspended);
     assert_eq!(
         fake.state().actor_state("default", "life"),
         Some(ateapi::ActorState::Suspended)
@@ -653,4 +654,200 @@ async fn the_service_drives_task_lifecycles_through_substrate() {
     let s = fake.state();
     assert!(s.actors.is_empty());
     assert!(s.templates.is_empty());
+}
+
+fn gateway(host: &str) -> rax_api::v1alpha1::Gateway {
+    use rax_api::substrate::ateapi::v1::{EgressRule, HttpsRule};
+    rax_api::v1alpha1::Gateway {
+        metadata: Some(ObjectMeta {
+            name: "gw".into(),
+            atespace: "default".into(),
+            ..Default::default()
+        }),
+        spec: Some(rax_api::v1alpha1::GatewaySpec {
+            egress: vec![EgressRule {
+                https: Some(HttpsRule {
+                    hostnames: vec![host.into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        }),
+        ..Default::default()
+    }
+}
+
+/// The actor of a task that binds a gateway gets that gateway's rules as its
+/// egress policy, once. For a task that binds none, the reconciler makes no
+/// egress policy call.
+#[tokio::test]
+async fn gateway_rules_become_the_actor_egress_policy() {
+    let (fake, r) = setup("").await;
+    let mut unbound = task("unbound-task", "img");
+    r.suspend(&mut unbound, None, None).await.unwrap();
+    r.resume(&mut unbound, None, None).await.unwrap();
+    let egress_calls = |s: &rax_substrate::testing::State| {
+        s.calls_of("GetActorEgressPolicy").len() + s.calls_of("CreateActorEgressPolicy").len()
+    };
+    assert_eq!(egress_calls(&fake.state()), 0);
+
+    let mut bound = task("bound-task", "img");
+    bound.spec.as_mut().unwrap().gateway =
+        Some(rax_api::v1alpha1::GatewayRef { name: "gw".into() });
+    r.suspend(&mut bound, None, Some(gateway("a.example.com")))
+        .await
+        .unwrap();
+    // A later binding with other rules keeps the policy the actor has.
+    r.resume(&mut bound, None, Some(gateway("b.example.com")))
+        .await
+        .unwrap();
+    {
+        let s = fake.state();
+        assert_eq!(
+            s.calls_of("CreateActorEgressPolicy"),
+            ["default/bound-task"]
+        );
+        let policy = &s.egress_policies["default/bound-task"];
+        assert_eq!(policy.metadata.as_ref().unwrap().name, "default");
+        assert_eq!(
+            policy.rules[0].https.as_ref().unwrap().hostnames,
+            ["a.example.com"]
+        );
+    }
+
+    // A bound gateway that does not exist fails the binding.
+    let mut missing = task("missing-gw", "img");
+    missing.spec.as_mut().unwrap().gateway =
+        Some(rax_api::v1alpha1::GatewayRef { name: "gw".into() });
+    let err = r.suspend(&mut missing, None, None).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
+    assert_condition(&missing, "Ready", "False", reason::GATEWAY_BINDING_FAILED);
+}
+
+/// A profile naming an existing ActorTemplate runs from it: no per-task
+/// template is made, and deleting the task leaves the template.
+#[tokio::test]
+async fn ate_actor_templates_are_used_as_they_are() {
+    let (fake, r) = setup("").await;
+    fake.state()
+        .templates
+        .insert("default/custom-base".into(), template("custom-base"));
+    let mut t = task("tpl-task", "");
+    t.spec.as_mut().unwrap().profile = Some(Profile {
+        ate_actor_template: "custom-base".into(),
+        ..Default::default()
+    });
+    r.suspend(&mut t, None, None).await.unwrap();
+    assert_eq!(status(&t).ate_actor_template, "custom-base");
+    assert!(fake.state().created_templates.is_empty());
+    r.delete(&t).await.unwrap();
+    assert!(fake.state().templates.contains_key("default/custom-base"));
+}
+
+/// A task without a profile runs with its workspace's; a task profile with
+/// any field set is used as it is, falling back to server defaults.
+#[tokio::test]
+async fn workspace_profiles_apply_whole() {
+    use rax_api::v1alpha1::{Workspace, WorkspaceRef, WorkspaceSpec};
+    const DEFAULT_IMG: &str = "ghcr.io/default/runner@sha256:1111";
+    let (fake, r) = setup(DEFAULT_IMG).await;
+    let limits = |cpu: &str, memory: &str| {
+        Some(ResourcesSpec {
+            limits: Some(ResourceList {
+                cpu: cpu.into(),
+                memory: memory.into(),
+            }),
+        })
+    };
+    let workspace = |name: &str, profile: Profile| Workspace {
+        metadata: Some(ObjectMeta {
+            name: name.into(),
+            atespace: "default".into(),
+            ..Default::default()
+        }),
+        spec: Some(WorkspaceSpec {
+            profile: Some(profile),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let ws = workspace(
+        "warm-ws",
+        Profile {
+            image: "ghcr.io/ws/image@sha256:2222".into(),
+            resources: limits("4", "8Gi"),
+            ..Default::default()
+        },
+    );
+    let bound = |name: &str, ws: &str, profile: Option<Profile>| {
+        let mut t = task(name, "");
+        let spec = t.spec.as_mut().unwrap();
+        spec.profile = profile;
+        spec.workspace = Some(WorkspaceRef {
+            name: ws.into(),
+            ..Default::default()
+        });
+        t
+    };
+
+    // 1. A task without a profile inherits the workspace's.
+    let mut inherited = bound("inherited-task", "warm-ws", None);
+    r.suspend(&mut inherited, Some(ws.clone()), None)
+        .await
+        .unwrap();
+    // 2. A task profile setting only resources uses server defaults for the
+    // rest, not the workspace's.
+    let mut resources_only = bound(
+        "resources-only-task",
+        "warm-ws",
+        Some(Profile {
+            resources: limits("", "2Gi"),
+            ..Default::default()
+        }),
+    );
+    r.suspend(&mut resources_only, Some(ws), None)
+        .await
+        .unwrap();
+    // 3. The same over a workspace that names an ActorTemplate.
+    fake.state()
+        .templates
+        .insert("default/ws-base-tpl".into(), template("ws-base-tpl"));
+    let tpl_ws = workspace(
+        "tpl-ws",
+        Profile {
+            ate_actor_template: "ws-base-tpl".into(),
+            ..Default::default()
+        },
+    );
+    let mut over_tpl = bound(
+        "task-over-tpl-ws",
+        "tpl-ws",
+        Some(Profile {
+            resources: limits("", "1Gi"),
+            ..Default::default()
+        }),
+    );
+    r.suspend(&mut over_tpl, Some(tpl_ws), None).await.unwrap();
+
+    let s = fake.state();
+    let got: Vec<_> = s
+        .created_templates
+        .iter()
+        .map(|t| {
+            let l = t.resources.as_ref().unwrap().limits.unwrap();
+            (
+                t.containers[0].image.as_str(),
+                l.cpu_millicores,
+                l.memory_bytes,
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("ghcr.io/ws/image@sha256:2222", 4000, 8 << 30),
+            (DEFAULT_IMG, DEFAULT_CPU_MILLICORES, 2 << 30),
+            (DEFAULT_IMG, DEFAULT_CPU_MILLICORES, 1 << 30),
+        ]
+    );
 }

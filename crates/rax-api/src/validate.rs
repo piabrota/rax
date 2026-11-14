@@ -10,7 +10,10 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::substrate::ateapi::v1::{EgressRule, HttpRuleEffects, Ports};
-use crate::v1alpha1::{Gateway, Model, ObjectMeta, Task, TaskSpec, Workspace};
+use crate::v1alpha1::{
+    File, Gateway, GatewayRef, GitRepo, Model, ObjectMeta, Profile, RetryConfig, SkillsConfig,
+    Task, TaskSpec, Workspace, WorkspaceSetup,
+};
 
 /// A problem that makes a resource unusable, phrased for the person who wrote
 /// the manifest.
@@ -23,7 +26,8 @@ impl ValidationError {
         Self(msg.into())
     }
 
-    pub(crate) fn prefixed(self, field: &str) -> Self {
+    /// Prefixes the message with the field it is about.
+    pub fn prefixed(self, field: &str) -> Self {
         Self(format!("{field}: {}", self.0))
     }
 }
@@ -43,7 +47,8 @@ pub const MAX_ENV_VALUE_SIZE: usize = 32 << 10;
 /// The largest a task's launch configuration may be once encoded as YAML, the
 /// form in which it reaches the runner through `AX_TASK_YAML`. It keeps 1 KiB
 /// of [`MAX_ENV_VALUE_SIZE`] in reserve for fields the control plane fills in
-/// after validation, such as metadata.atespace and metadata.createTime.
+/// after validation, such as metadata.atespace, metadata.uid,
+/// metadata.createTime and spec.sessionId.
 pub const MAX_TASK_YAML_SIZE: usize = MAX_ENV_VALUE_SIZE - (1 << 10);
 
 /// The largest spec.config a task may have, measured as its JSON encoding. It
@@ -84,16 +89,163 @@ pub fn validate_object_meta(meta: Option<&ObjectMeta>) -> Result<(), ValidationE
 /// Reports the first problem with a workspace that would make it unusable.
 pub fn validate_workspace(w: &Workspace) -> Result<(), ValidationError> {
     validate_object_meta(w.metadata.as_ref())?;
-    if let Some(spec) = &w.spec {
-        for (i, f) in spec.files.iter().enumerate() {
-            if f.path.is_empty() {
-                return Err(ValidationError::new(format!(
-                    "spec.files[{i}]: path is required"
-                )));
-            }
+    let Some(spec) = &w.spec else { return Ok(()) };
+    validate_profile("spec.profile", spec.profile.as_ref())?;
+    validate_setup(spec.setup.as_ref())
+}
+
+/// Checks a compute profile: an `ateActorTemplate` names an existing
+/// ActorTemplate and stands alone; otherwise the resources must be valid.
+fn validate_profile(field: &str, p: Option<&Profile>) -> Result<(), ValidationError> {
+    let Some(p) = p else { return Ok(()) };
+    let tpl = p.ate_actor_template.as_str();
+    if !tpl.is_empty() {
+        validate_name(tpl)
+            .map_err(|e| e.prefixed(&format!("{field}.ateActorTemplate: invalid value {tpl:?}")))?;
+        if !p.image.is_empty() || p.resources.is_some() {
+            return Err(ValidationError::new(format!(
+                "{field}.ateActorTemplate: cannot be combined with image or resources"
+            )));
+        }
+        return Ok(());
+    }
+    crate::resources::validate_resources_at(&format!("{field}.resources"), p.resources.as_ref())
+}
+
+fn validate_gateway_ref(field: &str, r: Option<&GatewayRef>) -> Result<(), ValidationError> {
+    let Some(r) = r else { return Ok(()) };
+    validate_name(&r.name)
+        .map_err(|e| e.prefixed(&format!("{field}.name: invalid value {:?}", r.name)))
+}
+
+fn validate_setup(setup: Option<&WorkspaceSetup>) -> Result<(), ValidationError> {
+    let Some(setup) = setup else { return Ok(()) };
+    for (i, g) in setup.git.iter().enumerate() {
+        validate_git_repo(&format!("spec.setup.git[{i}]"), g)?;
+    }
+    for (i, f) in setup.files.iter().enumerate() {
+        validate_setup_file(&format!("spec.setup.files[{i}]"), f)?;
+    }
+    validate_skills(setup.skills.as_ref())?;
+    validate_gateway_ref("spec.setup.gateway", setup.gateway.as_ref())
+}
+
+fn validate_git_repo(field: &str, g: &GitRepo) -> Result<(), ValidationError> {
+    let repo = g.repo.as_str();
+    if repo.trim().is_empty() {
+        return Err(ValidationError::new(format!("{field}: repo is required")));
+    }
+    if has_invalid_git_arg(repo) {
+        return Err(ValidationError::new(format!(
+            "{field}.repo: invalid repository {repo:?}"
+        )));
+    }
+    let lower = repo.to_lowercase();
+    if lower.starts_with("git@") || lower.starts_with("ssh://") {
+        return Err(ValidationError::new(format!(
+            "{field}.repo: SSH git URLs ({repo:?}) are not supported; use HTTPS"
+        )));
+    }
+    if !g.r#ref.is_empty() && has_invalid_git_arg(&g.r#ref) {
+        return Err(ValidationError::new(format!(
+            "{field}.ref: invalid ref {:?}",
+            g.r#ref
+        )));
+    }
+    if g.depth < 0 {
+        return Err(ValidationError::new(format!(
+            "{field}.depth: must be greater than or equal to 0"
+        )));
+    }
+    if !g.name.is_empty() {
+        validate_relative_path(&format!("{field}.name"), &g.name)?;
+        if clean_path(&g.name) == "." {
+            return Err(ValidationError::new(format!(
+                "{field}.name: {:?} is invalid; set dir: \".\" to clone into the workspace root",
+                g.name
+            )));
         }
     }
+    validate_relative_path(&format!("{field}.dir"), &g.dir)
+}
+
+fn validate_setup_file(field: &str, f: &File) -> Result<(), ValidationError> {
+    let p = f.path.as_str();
+    if p.trim().is_empty() {
+        return Err(ValidationError::new(format!("{field}: path is required")));
+    }
+    validate_relative_path(&format!("{field}.path"), p)?;
+    if p.ends_with('/') || clean_path(p) == "." {
+        return Err(ValidationError::new(format!(
+            "{field}.path: {p:?} must name a file, not a directory"
+        )));
+    }
     Ok(())
+}
+
+fn validate_skills(skills: Option<&SkillsConfig>) -> Result<(), ValidationError> {
+    let p = skills.map_or("", |s| s.path.as_str());
+    if !p.is_empty() && !p.starts_with('/') && escapes_workspace_root(p) {
+        return Err(ValidationError::new(format!(
+            "spec.setup.skills.path: {p:?} must not escape the workspace root"
+        )));
+    }
+    Ok(())
+}
+
+/// Reports whether `s` could be read by git as an option or split into
+/// several arguments.
+fn has_invalid_git_arg(s: &str) -> bool {
+    s.starts_with('-') || s.contains([' ', '\t', '\r', '\n', '\0'])
+}
+
+fn validate_relative_path(field: &str, p: &str) -> Result<(), ValidationError> {
+    if p.is_empty() {
+        return Ok(());
+    }
+    if p.starts_with('/') {
+        return Err(ValidationError::new(format!(
+            "{field}: {p:?} must be relative to the workspace root"
+        )));
+    }
+    if escapes_workspace_root(p) {
+        return Err(ValidationError::new(format!(
+            "{field}: {p:?} must not escape the workspace root"
+        )));
+    }
+    Ok(())
+}
+
+fn escapes_workspace_root(rel: &str) -> bool {
+    let clean = clean_path(rel);
+    clean == ".." || clean.starts_with("../")
+}
+
+/// Lexically cleans a slash-separated path the way Go's `path.Clean` does:
+/// it drops empty and `.` elements and resolves `..` against the elements
+/// before it. An empty result is `.`.
+pub(crate) fn clean_path(p: &str) -> String {
+    let rooted = p.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    for part in p.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if out.last().is_some_and(|l| *l != "..") {
+                    out.pop();
+                } else if !rooted {
+                    out.push("..");
+                }
+            }
+            _ => out.push(part),
+        }
+    }
+    let joined = out.join("/");
+    match (rooted, joined.is_empty()) {
+        (true, _) => format!("/{joined}"),
+        (false, true) => ".".into(),
+        (false, false) => joined,
+    }
 }
 
 /// Reports the first problem with a model that would make it unusable.
@@ -206,6 +358,7 @@ fn is_ip_address(name: &str) -> bool {
 pub fn validate_task(t: &Task) -> Result<(), ValidationError> {
     validate_object_meta(t.metadata.as_ref())?;
     let spec = t.spec.as_ref();
+    validate_profile("spec.profile", spec.and_then(|s| s.profile.as_ref()))?;
     if let Some(r) = spec.and_then(|s| s.workspace.as_ref()) {
         if r.name.is_empty() {
             return Err(ValidationError::new("spec.workspace: name is required"));
@@ -217,17 +370,56 @@ pub fn validate_task(t: &Task) -> Result<(), ValidationError> {
             )));
         }
     }
-    if spec
-        .and_then(|s| s.gateway.as_ref())
-        .is_some_and(|r| r.name.is_empty())
-    {
-        return Err(ValidationError::new("spec.gateway: name is required"));
-    }
+    validate_gateway_ref("spec.gateway", spec.and_then(|s| s.gateway.as_ref()))?;
+    validate_retry("spec.retry", spec.and_then(|s| s.retry.as_ref()))?;
     if let Some(spec) = spec {
         validate_task_config(spec)?;
     }
-    validate_task_size(t)?;
-    crate::validate_resources(spec.and_then(|s| s.resources.as_ref()))
+    validate_task_size(t)
+}
+
+fn validate_retry(field: &str, r: Option<&RetryConfig>) -> Result<(), ValidationError> {
+    let Some(r) = r else { return Ok(()) };
+    if r.max_retries < 0 {
+        return Err(ValidationError::new(format!(
+            "{field}.maxRetries: must not be negative"
+        )));
+    }
+    let nanos = |d: &pbjson_types::Duration| -> Option<i128> {
+        // A valid Duration's seconds and nanos agree in sign, within the
+        // range protobuf allows.
+        let valid = d.seconds.abs() <= 315_576_000_000
+            && d.nanos.abs() < 1_000_000_000
+            && !(d.seconds > 0 && d.nanos < 0 || d.seconds < 0 && d.nanos > 0);
+        valid.then(|| i128::from(d.seconds) * 1_000_000_000 + i128::from(d.nanos))
+    };
+    let initial = r.initial_backoff.as_ref().map(nanos);
+    let max = r.max_backoff.as_ref().map(nanos);
+    if initial.is_some_and(|d| d.is_none_or(|n| n < 0)) {
+        return Err(ValidationError::new(format!(
+            "{field}.initialBackoff: must not be negative"
+        )));
+    }
+    if max.is_some_and(|d| d.is_none_or(|n| n < 0)) {
+        return Err(ValidationError::new(format!(
+            "{field}.maxBackoff: must not be negative"
+        )));
+    }
+    if let (Some(Some(initial)), Some(Some(max))) = (initial, max)
+        && max > 0
+        && initial > max
+    {
+        return Err(ValidationError::new(format!(
+            "{field}.initialBackoff: must not exceed maxBackoff"
+        )));
+    }
+    let m = r.backoff_multiplier;
+    if m != 0.0 && (!m.is_finite() || m < 1.0) {
+        return Err(ValidationError::new(format!(
+            "{field}.backoffMultiplier: must be >= 1.0"
+        )));
+    }
+    Ok(())
 }
 
 /// Checks that the task's launch configuration, encoded as the control plane
@@ -269,7 +461,10 @@ pub fn validate_task_config(spec: &TaskSpec) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v1alpha1::{EnvVar, File, GatewayRef, WorkspaceRef, WorkspaceSpec};
+    use crate::v1alpha1::{
+        EnvVar, Goal, McpConfig, McpServer, ResourceList, ResourcesSpec, WorkspaceRef,
+        WorkspaceSpec,
+    };
 
     fn meta(name: &str, atespace: &str) -> Option<ObjectMeta> {
         Some(ObjectMeta {
@@ -540,6 +735,21 @@ mod tests {
                 path: path.into(),
             })
         };
+        let limits = |cpu: &str, memory: &str| ResourcesSpec {
+            limits: Some(ResourceList {
+                cpu: cpu.into(),
+                memory: memory.into(),
+            }),
+        };
+        let template = |name: &str| Profile {
+            ate_actor_template: name.into(),
+            ..Default::default()
+        };
+        let secs = |seconds: i64| pbjson_types::Duration { seconds, nanos: 0 };
+        let retry = |r: RetryConfig| TaskSpec {
+            retry: Some(r),
+            ..Default::default()
+        };
         let blob = |n: usize| config(serde_json::json!({ "blob": "x".repeat(n) }));
         let cases: Vec<(&str, Option<TaskSpec>, &str)> = vec![
             ("nil spec", None, ""),
@@ -582,7 +792,115 @@ mod tests {
                     gateway: Some(GatewayRef::default()),
                     ..Default::default()
                 }),
-                "spec.gateway: name is required",
+                "spec.gateway.name",
+            ),
+            (
+                "profile image and resources",
+                Some(TaskSpec {
+                    profile: Some(Profile {
+                        image: "us-docker.pkg.dev/p/img@sha256:abc".into(),
+                        resources: Some(limits("2", "4Gi")),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                "",
+            ),
+            (
+                "profile ate_actor_template",
+                Some(TaskSpec {
+                    profile: Some(template("base-template")),
+                    ..Default::default()
+                }),
+                "",
+            ),
+            (
+                "profile ate_actor_template invalid name",
+                Some(TaskSpec {
+                    profile: Some(template("Bad_Name")),
+                    ..Default::default()
+                }),
+                "spec.profile.ateActorTemplate",
+            ),
+            (
+                "profile ate_actor_template combined with image",
+                Some(TaskSpec {
+                    profile: Some(Profile {
+                        image: "us-docker.pkg.dev/p/img@sha256:abc".into(),
+                        ..template("base-template")
+                    }),
+                    ..Default::default()
+                }),
+                "cannot be combined with image or resources",
+            ),
+            (
+                "profile ate_actor_template combined with resources",
+                Some(TaskSpec {
+                    profile: Some(Profile {
+                        resources: Some(limits("1", "")),
+                        ..template("base-template")
+                    }),
+                    ..Default::default()
+                }),
+                "cannot be combined with image or resources",
+            ),
+            (
+                "goal retry and session_id",
+                Some(TaskSpec {
+                    goal: Some(Goal {
+                        spec: "Fix failing unit tests".into(),
+                    }),
+                    session_id: "session-42".into(),
+                    retry: Some(RetryConfig {
+                        max_retries: 3,
+                        initial_backoff: Some(secs(10)),
+                        max_backoff: Some(secs(300)),
+                        backoff_multiplier: 2.0,
+                    }),
+                    ..Default::default()
+                }),
+                "",
+            ),
+            (
+                "negative max_retries",
+                Some(retry(RetryConfig {
+                    max_retries: -1,
+                    ..Default::default()
+                })),
+                "spec.retry.maxRetries",
+            ),
+            (
+                "negative initial_backoff",
+                Some(retry(RetryConfig {
+                    initial_backoff: Some(secs(-1)),
+                    ..Default::default()
+                })),
+                "spec.retry.initialBackoff",
+            ),
+            (
+                "negative max_backoff",
+                Some(retry(RetryConfig {
+                    max_backoff: Some(secs(-1)),
+                    ..Default::default()
+                })),
+                "spec.retry.maxBackoff",
+            ),
+            (
+                "initial_backoff exceeds max_backoff",
+                Some(retry(RetryConfig {
+                    initial_backoff: Some(secs(120)),
+                    max_backoff: Some(secs(60)),
+                    ..Default::default()
+                })),
+                "spec.retry.initialBackoff: must not exceed maxBackoff",
+            ),
+            (
+                "backoff_multiplier below 1",
+                Some(retry(RetryConfig {
+                    backoff_multiplier: 0.5,
+                    ..Default::default()
+                })),
+                "spec.retry.backoffMultiplier",
             ),
             (
                 "relative path",
@@ -633,9 +951,9 @@ mod tests {
                 "task: encoded launch configuration",
             ),
             (
-                "oversized command",
+                "oversized commands",
                 Some(TaskSpec {
-                    command: vec!["sh".into(), "-c".into(), "z".repeat(MAX_ENV_VALUE_SIZE)],
+                    commands: vec!["sh".into(), "-c".into(), "z".repeat(MAX_ENV_VALUE_SIZE)],
                     ..Default::default()
                 }),
                 "task: encoded launch configuration",
@@ -661,20 +979,297 @@ mod tests {
     }
 
     #[test]
-    fn workspace_files_need_a_path() {
-        let ws = Workspace {
-            metadata: meta("valid-ws", ""),
-            spec: Some(WorkspaceSpec {
+    fn valid_workspaces() {
+        let full = WorkspaceSpec {
+            profile: Some(Profile {
+                image: "us-docker.pkg.dev/p/img@sha256:abc".into(),
+                resources: Some(ResourcesSpec {
+                    limits: Some(ResourceList {
+                        cpu: "2".into(),
+                        memory: "4Gi".into(),
+                    }),
+                }),
+                ..Default::default()
+            }),
+            setup: Some(WorkspaceSetup {
+                git: vec![GitRepo {
+                    repo: "https://github.com/org/repo.git".into(),
+                    dir: ".".into(),
+                    r#ref: "main".into(),
+                    depth: 1,
+                    ..Default::default()
+                }],
                 files: vec![File {
-                    path: "".into(),
-                    content: "missing path".into(),
+                    path: "AGENTS.md".into(),
+                    content: "hi".into(),
+                }],
+                commands: vec!["go mod download".into()],
+                gateway: Some(GatewayRef {
+                    name: "build-gw".into(),
+                }),
+                ..Default::default()
+            }),
+            mcp: Some(McpConfig {
+                servers: vec![McpServer {
+                    name: "gh".into(),
+                    endpoint: "https://example.com/mcp".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        };
+        let local = WorkspaceSpec {
+            setup: Some(WorkspaceSetup {
+                git: vec![GitRepo {
+                    repo: "/opt/e2e-fixtures/sample-repo.git".into(),
+                    r#ref: "main".into(),
+                    ..Default::default()
                 }],
                 ..Default::default()
             }),
             ..Default::default()
         };
-        let err = validate_workspace(&ws).unwrap_err().to_string();
-        assert!(err.contains("spec.files[0]: path is required"), "{err}");
+        for (name, spec) in [
+            ("nil spec", None),
+            ("full", Some(full)),
+            ("local repo", Some(local)),
+        ] {
+            let ws = Workspace {
+                metadata: meta("valid-ws", ""),
+                spec,
+                ..Default::default()
+            };
+            validate_workspace(&ws).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+    }
+
+    #[test]
+    fn invalid_workspaces() {
+        let setup = |s: WorkspaceSetup| WorkspaceSpec {
+            setup: Some(s),
+            ..Default::default()
+        };
+        let files = |path: &str| {
+            setup(WorkspaceSetup {
+                files: vec![File {
+                    path: path.into(),
+                    content: "x".into(),
+                }],
+                ..Default::default()
+            })
+        };
+        let git = |g: GitRepo| {
+            setup(WorkspaceSetup {
+                git: vec![g],
+                ..Default::default()
+            })
+        };
+        let repo = |r: &str| GitRepo {
+            repo: r.into(),
+            ..Default::default()
+        };
+        let https = || repo("https://example.com/r.git");
+        let profile = |p: Profile| WorkspaceSpec {
+            profile: Some(p),
+            ..Default::default()
+        };
+        let template = || Profile {
+            ate_actor_template: "base-template".into(),
+            ..Default::default()
+        };
+        let cases: Vec<(&str, WorkspaceSpec, &str)> = vec![
+            (
+                "missing file path",
+                files(""),
+                "spec.setup.files[0]: path is required",
+            ),
+            (
+                "file path escapes",
+                files("../etc/passwd"),
+                "spec.setup.files[0].path",
+            ),
+            (
+                "file path absolute",
+                files("/etc/passwd"),
+                "spec.setup.files[0].path",
+            ),
+            ("file path dot", files("."), "spec.setup.files[0].path"),
+            (
+                "file path trailing slash",
+                files("dir/"),
+                "spec.setup.files[0].path",
+            ),
+            (
+                "missing git repo",
+                git(GitRepo {
+                    r#ref: "main".into(),
+                    ..Default::default()
+                }),
+                "spec.setup.git[0]: repo is required",
+            ),
+            (
+                "ssh git repo",
+                git(repo("git@github.com:org/repo.git")),
+                "SSH git URLs",
+            ),
+            (
+                "uppercase ssh git repo",
+                git(repo("SSH://git@github.com/org/repo.git")),
+                "SSH git URLs",
+            ),
+            (
+                "git repo leading dash",
+                git(repo("--upload-pack=bad")),
+                "spec.setup.git[0].repo",
+            ),
+            (
+                "git ref option injection",
+                git(GitRepo {
+                    r#ref: "--upload-pack=touch /tmp/pwn".into(),
+                    ..https()
+                }),
+                "spec.setup.git[0].ref",
+            ),
+            (
+                "git ref whitespace",
+                git(GitRepo {
+                    r#ref: "main ".into(),
+                    ..https()
+                }),
+                "spec.setup.git[0].ref",
+            ),
+            (
+                "negative git depth",
+                git(GitRepo {
+                    depth: -1,
+                    ..https()
+                }),
+                "spec.setup.git[0].depth",
+            ),
+            (
+                "git name escapes",
+                git(GitRepo {
+                    name: "../escaped-repo".into(),
+                    ..https()
+                }),
+                "spec.setup.git[0].name",
+            ),
+            (
+                "git name absolute",
+                git(GitRepo {
+                    name: "/etc/repo".into(),
+                    ..https()
+                }),
+                "spec.setup.git[0].name",
+            ),
+            (
+                "git name dot",
+                git(GitRepo {
+                    name: "./".into(),
+                    ..https()
+                }),
+                "set dir",
+            ),
+            (
+                "git dir escapes",
+                git(GitRepo {
+                    dir: "../escape".into(),
+                    ..https()
+                }),
+                "spec.setup.git[0].dir",
+            ),
+            (
+                "git dir absolute",
+                git(GitRepo {
+                    dir: "/etc".into(),
+                    ..https()
+                }),
+                "spec.setup.git[0].dir",
+            ),
+            (
+                "skills path escapes",
+                setup(WorkspaceSetup {
+                    skills: Some(SkillsConfig {
+                        path: "../outside-skills".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                "spec.setup.skills.path",
+            ),
+            (
+                "invalid profile resources",
+                profile(Profile {
+                    resources: Some(ResourcesSpec {
+                        limits: Some(ResourceList {
+                            cpu: "bad".into(),
+                            ..Default::default()
+                        }),
+                    }),
+                    ..Default::default()
+                }),
+                "spec.profile.resources.limits.cpu",
+            ),
+            (
+                "invalid ate_actor_template",
+                profile(Profile {
+                    ate_actor_template: "Bad_Name".into(),
+                    ..Default::default()
+                }),
+                "spec.profile.ateActorTemplate",
+            ),
+            (
+                "ate_actor_template with image",
+                profile(Profile {
+                    image: "us-docker.pkg.dev/p/img@sha256:abc".into(),
+                    ..template()
+                }),
+                "cannot be combined with image or resources",
+            ),
+            (
+                "ate_actor_template with resources",
+                profile(Profile {
+                    resources: Some(ResourcesSpec::default()),
+                    ..template()
+                }),
+                "cannot be combined with image or resources",
+            ),
+            (
+                "invalid setup gateway",
+                setup(WorkspaceSetup {
+                    gateway: Some(GatewayRef {
+                        name: "Bad_Name".into(),
+                    }),
+                    ..Default::default()
+                }),
+                "spec.setup.gateway.name",
+            ),
+        ];
+        for (name, spec, want) in cases {
+            let ws = Workspace {
+                metadata: meta("valid-ws", ""),
+                spec: Some(spec),
+                ..Default::default()
+            };
+            let err = validate_workspace(&ws).expect_err(name).to_string();
+            assert!(err.contains(want), "{name}: {err}, want {want:?}");
+        }
+    }
+
+    #[test]
+    fn clean_paths() {
+        for (input, want) in [
+            ("", "."),
+            (".", "."),
+            ("./", "."),
+            ("a/b/../c", "a/c"),
+            ("../x", "../x"),
+            ("a/../..", ".."),
+            ("a//b/", "a/b"),
+            ("/a/../..", "/"),
+        ] {
+            assert_eq!(clean_path(input), want, "{input}");
+        }
     }
 
     #[test]

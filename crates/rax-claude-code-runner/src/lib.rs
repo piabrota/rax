@@ -1,11 +1,11 @@
 //! A port of AX's `claude-code-runner`: a task runner that runs Claude Code
 //! configured from the Task itself.
 //!
-//! When the task leaves `spec.command` empty, the runner runs one headless
+//! When the task leaves `spec.commands` empty, the runner runs one headless
 //! `claude --print` session in the workspace. `spec.config` holds the prompt
 //! and claude's flags, named as in `claude --help` (see [`claude_args`]), and
 //! the session is connected to the MCP servers the bound Workspace declares.
-//! A task that sets `spec.command` runs it unchanged, exactly as with
+//! A task that sets `spec.commands` runs it unchanged, exactly as with
 //! `rax-task-runner`. Everything else, from workspace setup to supervision
 //! and shutdown, is the standard [`rax_task_runner::runner`] lifecycle.
 
@@ -231,20 +231,20 @@ pub fn mcp_servers(mcp: Option<&McpConfig>) -> Map<String, Json> {
     servers.into_iter().collect()
 }
 
-/// The task with `spec.command` set to the claude invocation described by
+/// The task with `spec.commands` set to the claude invocation described by
 /// `spec.config` and the MCP servers of `workspace`. A task that already sets
-/// `spec.command`, or has no `spec.config`, is returned unchanged.
+/// `spec.commands`, or has no `spec.config`, is returned unchanged.
 pub fn with_claude_command(mut task: Task, workspace: Option<&Workspace>) -> Result<Task, String> {
     let Some(spec) = task.spec.as_mut() else {
         return Ok(task);
     };
-    if !spec.command.is_empty() || spec.config.is_none() {
+    if !spec.commands.is_empty() || spec.config.is_none() {
         return Ok(task);
     }
     let mcp = workspace
         .and_then(|w| w.spec.as_ref())
         .and_then(|s| s.mcp.as_ref());
-    spec.command = claude_args(spec.config.as_ref(), mcp)?;
+    spec.commands = claude_args(spec.config.as_ref(), mcp)?;
     Ok(task)
 }
 

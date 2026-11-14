@@ -1,5 +1,6 @@
-//! Workspace setup on a task's first run: inlined files, git checkouts and
-//! the skills directory, with a marker recording that it is done.
+//! Workspace setup on a task's first run: git checkouts at their ref, inlined
+//! files, the skills directory and setup commands, with a marker recording
+//! that it is done.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -12,10 +13,17 @@ use tokio::process::Command;
 pub const DEFAULT_AX_DIR: &str = "/ax";
 /// The base name of the marker written after a successful first run.
 pub const INITIALIZED_MARKER_FILENAME: &str = "initialized";
-/// The directory under the workspace that holds the marker.
+/// The directory under the workspace that holds the marker and the default
+/// skills directory.
 const MARKER_DIR_NAME: &str = ".ax";
+const DEFAULT_SKILLS_SUBDIR: &str = "skills";
+/// How long one `spec.setup.commands` entry may run, so that a hung command
+/// fails setup instead of leaving the workspace unready forever.
+pub const DEFAULT_SETUP_COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// How much of a failed command's output its error keeps.
+const MAX_COMMAND_OUTPUT_IN_ERROR: usize = 2048;
 
-const DEFAULT_BRANCH: &str = "main";
+const DEFAULT_GIT_REF: &str = "main";
 const DEFAULT_REPO_DIR_NAME: &str = "repo";
 const GIT_SUCCESS_LOG: &str = "git-success.log";
 const GIT_ERROR_LOG: &str = "git-error.log";
@@ -28,18 +36,21 @@ pub struct SetupResult {
     pub workspace_path: PathBuf,
     pub cloned_repos: Vec<String>,
     pub skills_mounted: String,
+    pub commands_run: usize,
     pub is_maiden_run: bool,
 }
 
-/// Prepares the workspace at `target` on its first run: writes the inlined
-/// files, clones the declared repositories and creates the skills path. A
-/// marker on the workspace volume (see [`workspace_marker_path`]) records a
-/// finished first run, so later calls do nothing.
+/// Prepares the workspace at `target` according to `spec.setup` on its first
+/// run:
+///  1. clones the declared repositories at their ref;
+///  2. writes the inlined files;
+///  3. creates the skills directory;
+///  4. runs the setup commands one after another.
 ///
-/// Git failures are logged and recorded under `ax_dir` but don't fail setup;
-/// the marker is withheld so the next start retries the clone. Failing to
-/// create the workspace directory is an error, and so is a marker path that
-/// is a symbolic link.
+/// A marker on the workspace volume (see [`workspace_marker_path`]) records a
+/// finished first run, so later calls do nothing. Any failure withholds the
+/// marker and is returned, so the workspace is not marked ready and the next
+/// start retries setup.
 pub async fn setup_workspace(
     ws: Option<&Workspace>,
     target: &str,
@@ -69,10 +80,7 @@ pub async fn setup_workspace(
 
     let marker = workspace_marker_path(&target);
     if marker_linked(&marker) {
-        return Err(std::io::Error::other(format!(
-            "marker path {} is a symbolic link; refusing to trust or write it",
-            marker.display()
-        )));
+        return Err(linked_marker(&marker));
     }
     if marker.exists() {
         tracing::info!(path = %target.display(), "workspace already initialized; skipping maiden run setup");
@@ -85,52 +93,78 @@ pub async fn setup_workspace(
         && legacy_owned_by(&data, ws)
     {
         tracing::info!(path = %target.display(), "migrating legacy workspace marker");
-        write_marker(&workspace_marker_path(&target), ws);
+        write_marker(&workspace_marker_path(&target), ws)
+            .map_err(|e| wrap(e, "writing initialization marker"))?;
         return Ok(res);
     }
 
     tracing::info!(path = %target.display(), "executing workspace maiden run setup");
     res.is_maiden_run = true;
 
-    let mut git_ok = true;
-    if let Some(spec) = ws.and_then(|w| w.spec.as_ref()) {
-        write_files(&spec.files, &target);
-        (res.cloned_repos, git_ok) = clone_repos(&spec.git, &target, ax_dir).await;
-        res.skills_mounted = setup_skills(spec.skills.as_ref());
+    if let Some(setup) = ws
+        .and_then(|w| w.spec.as_ref())
+        .and_then(|s| s.setup.as_ref())
+    {
+        clone_repos(&setup.git, &target, ax_dir, &mut res.cloned_repos).await?;
+        write_files(&setup.files, &target)?;
+        res.skills_mounted = setup_skills(setup.skills.as_ref(), &target)?;
+        run_setup_commands(&setup.commands, &target, &mut res.commands_run).await?;
     }
 
-    if !git_ok {
-        tracing::warn!(path = %target.display(), "maiden run workspace setup completed with errors; marker omitted to allow retry");
-        return Ok(res);
-    }
     // A repository cloned into the workspace root moves the marker into its
     // .git directory, so look the path up again.
-    write_marker(&workspace_marker_path(&target), ws);
+    let marker = workspace_marker_path(&target);
+    if marker_linked(&marker) {
+        return Err(linked_marker(&marker));
+    }
+    write_marker(&marker, ws).map_err(|e| {
+        wrap(
+            e,
+            &format!("writing initialization marker {}", marker.display()),
+        )
+    })?;
     tracing::info!(path = %target.display(), "maiden run workspace setup completed successfully");
     Ok(res)
 }
 
-/// Fetches each repository into the workspace, returning the ones that
-/// succeeded and whether all did.
-async fn clone_repos(repos: &[GitRepo], target: &Path, ax_dir: &Path) -> (Vec<String>, bool) {
-    let mut cloned = Vec::new();
-    let mut ok = true;
+fn linked_marker(marker: &Path) -> std::io::Error {
+    std::io::Error::other(format!(
+        "marker path {} is a symbolic link; refusing to trust or write it",
+        marker.display()
+    ))
+}
+
+fn wrap(e: std::io::Error, what: &str) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("{what}: {e}"))
+}
+
+/// Fetches each repository into the workspace, recording those that
+/// succeeded in `cloned`. The first that fails, after retries, fails setup.
+async fn clone_repos(
+    repos: &[GitRepo],
+    target: &Path,
+    ax_dir: &Path,
+    cloned: &mut Vec<String>,
+) -> std::io::Result<()> {
     for repo in repos.iter().filter(|r| !r.repo.is_empty()) {
-        let dest = clone_destination(repo, target);
-        if let Err(e) = std::fs::create_dir_all(&dest) {
-            tracing::warn!(dir = %dest.display(), error = %e, "failed to create destination dir");
-        }
-        let branch = if repo.branch.is_empty() {
-            DEFAULT_BRANCH
+        let dest = clone_destination(repo, target)?;
+        std::fs::create_dir_all(&dest).map_err(|e| {
+            wrap(
+                e,
+                &format!("creating git checkout directory {}", dest.display()),
+            )
+        })?;
+        let git_ref = if repo.r#ref.is_empty() {
+            DEFAULT_GIT_REF
         } else {
-            &repo.branch
+            &repo.r#ref
         };
-        tracing::info!(repo = %repo.repo, branch, dir = %dest.display(), depth = repo.depth, "initializing and fetching git repo");
+        tracing::info!(repo = %repo.repo, git_ref, dir = %dest.display(), depth = repo.depth, "initializing and fetching git repo");
 
         let mut out = Vec::new();
         let mut result = Err(String::new());
         for attempt in 1..=GIT_RETRIES {
-            (out, result) = fetch_repo(&dest, &repo.repo, branch, repo.depth).await;
+            (out, result) = fetch_repo(&dest, &repo.repo, git_ref, repo.depth).await;
             match &result {
                 Ok(()) => break,
                 Err(e) if attempt < GIT_RETRIES => {
@@ -140,60 +174,67 @@ async fn clone_repos(repos: &[GitRepo], target: &Path, ax_dir: &Path) -> (Vec<St
                 Err(_) => {}
             }
         }
-        match result {
-            Ok(()) => {
-                cloned.push(repo.repo.clone());
-                write_state_file(ax_dir, GIT_SUCCESS_LOG, &out);
-            }
-            Err(e) => {
-                ok = false;
-                let output = String::from_utf8_lossy(&out);
-                tracing::warn!(repo = %repo.repo, error = %e, %output, "git fetch error (continuing setup)");
-                write_state_file(
-                    ax_dir,
-                    GIT_ERROR_LOG,
-                    format!("error: {e}\noutput: {output}\n").as_bytes(),
-                );
-            }
+        if let Err(e) = result {
+            let output = String::from_utf8_lossy(&out);
+            write_state_file(
+                ax_dir,
+                GIT_ERROR_LOG,
+                format!("error: {e}\noutput: {output}\n").as_bytes(),
+            );
+            return Err(std::io::Error::other(format!(
+                "cloning {} (ref {git_ref}): {e}",
+                repo.repo
+            )));
         }
+        cloned.push(repo.repo.clone());
+        write_state_file(ax_dir, GIT_SUCCESS_LOG, &out);
     }
-    (cloned, ok)
+    Ok(())
 }
 
 /// Where a repository is checked out.
 ///
-/// An explicit `dir` wins: `.` means the workspace root, an absolute path is
-/// used as is, and anything else is relative to the workspace. Otherwise the
+/// An explicit `dir` wins: `.` means the workspace root, and anything else
+/// must be relative to the workspace and stay within it. Otherwise the
 /// directory is named after the repository's `name`, unless that is empty or
 /// a placeholder such as `origin`, in which case it comes from the URL.
-pub fn clone_destination(repo: &GitRepo, target: &Path) -> PathBuf {
-    if !repo.dir.is_empty() {
-        return match repo.dir.as_str() {
-            "." => target.to_owned(),
-            d if Path::new(d).is_absolute() => PathBuf::from(d),
-            d => target.join(d),
-        };
-    }
-    let mut name = repo.name.clone();
-    if name.is_empty() || name == DEFAULT_REPO_DIR_NAME || name == "origin" {
-        let derived = repo_dir_name(&repo.repo);
-        if !derived.is_empty() {
-            name = derived;
-        } else if name.is_empty() {
-            name = DEFAULT_REPO_DIR_NAME.into();
+pub fn clone_destination(repo: &GitRepo, target: &Path) -> std::io::Result<PathBuf> {
+    let mut rel = repo.dir.clone();
+    if rel.is_empty() {
+        let mut name = repo.name.clone();
+        if name.is_empty() || name == DEFAULT_REPO_DIR_NAME || name == "origin" {
+            let derived = repo_dir_name(&repo.repo);
+            if !derived.is_empty() {
+                name = derived;
+            } else if name.is_empty() {
+                name = DEFAULT_REPO_DIR_NAME.into();
+            }
         }
+        rel = name;
     }
-    target.join(name)
+    if rel == "." {
+        return Ok(target.to_owned());
+    }
+    if !is_relative_within_root(&rel) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "git checkout path {rel:?} must stay within workspace {}",
+                target.display()
+            ),
+        ));
+    }
+    Ok(target.join(rel))
 }
 
-/// Initializes `dir` as a repository pointed at `url`, fetches `branch`
-/// (shallowly when `depth` > 0) and checks it out. It is idempotent, so it
-/// can be retried on a half-initialized directory. Arguments go straight to
-/// git, never through a shell.
+/// Initializes `dir` as a repository pointed at `url`, fetches `git_ref` (a
+/// branch, tag or commit SHA; shallowly when `depth` > 0) and checks it out.
+/// It is idempotent, so it can be retried on a half-initialized directory.
+/// Arguments go straight to git, never through a shell.
 async fn fetch_repo(
     dir: &Path,
     url: &str,
-    branch: &str,
+    git_ref: &str,
     depth: i32,
 ) -> (Vec<u8>, Result<(), String>) {
     let mut combined = Vec::new();
@@ -215,30 +256,149 @@ async fn fetch_repo(
     let result = async {
         run(&["init"]).await?;
         // A retry finds the remote already there, so update it instead.
-        if run(&["remote", "add", "origin", url]).await.is_err() {
-            run(&["remote", "set-url", "origin", url]).await?;
+        if run(&["remote", "add", "--", "origin", url]).await.is_err() {
+            run(&["remote", "set-url", "--", "origin", url]).await?;
         }
         let depth_arg = format!("--depth={depth}");
         let mut fetch = vec!["fetch"];
         if depth > 0 {
             fetch.push(&depth_arg);
         }
-        fetch.extend(["origin", branch]);
-        run(&fetch).await?;
-        run(&["checkout", "-f", "FETCH_HEAD"]).await
+        fetch.extend(["--", "origin", git_ref]);
+        if let Err(e) = run(&fetch).await {
+            // Servers that refuse to fetch an unadvertised, abbreviated commit
+            // SHA directly need a full fetch and then a checkout of the SHA.
+            if !looks_like_commit_sha(git_ref) {
+                return Err(e);
+            }
+            run(&["fetch", "--", "origin"]).await?;
+            return run(&["checkout", "-f", git_ref, "--"]).await;
+        }
+        run(&["checkout", "-f", "FETCH_HEAD", "--"]).await
     }
     .await;
     (combined, result)
 }
 
-fn setup_skills(skills: Option<&SkillsConfig>) -> String {
-    let Some(path) = skills.map(|s| &s.path).filter(|p| !p.is_empty()) else {
-        return String::new();
+fn looks_like_commit_sha(s: &str) -> bool {
+    (7..=40).contains(&s.len()) && s.bytes().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Creates the skills directory when one is declared or registries are
+/// configured, returning its path. Without a path, registries get
+/// `.ax/skills` under the workspace.
+fn setup_skills(skills: Option<&SkillsConfig>, target: &Path) -> std::io::Result<String> {
+    let Some(skills) = skills else {
+        return Ok(String::new());
     };
-    if let Err(e) = std::fs::create_dir_all(path) {
-        tracing::warn!(path, error = %e, "creating skills dir");
+    let dest = match skills.path.as_str() {
+        "" if skills.registries.is_empty() => return Ok(String::new()),
+        "" => target.join(MARKER_DIR_NAME).join(DEFAULT_SKILLS_SUBDIR),
+        p if Path::new(p).is_absolute() => PathBuf::from(p),
+        p if !is_relative_within_root(p) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("skills path {p:?} escapes workspace {}", target.display()),
+            ));
+        }
+        p => target.join(p),
+    };
+    std::fs::create_dir_all(&dest)
+        .map_err(|e| wrap(e, &format!("creating skills dir {}", dest.display())))?;
+    if !skills.registries.is_empty() {
+        // Fetching skill bundles from registries is not implemented yet, as
+        // in AX.
+        tracing::info!(path = %dest.display(), registries = skills.registries.len(), "prepared skills directory; registry skill download not implemented yet");
     }
-    path.clone()
+    Ok(dest.to_string_lossy().into_owned())
+}
+
+/// Runs the setup commands one after another in the workspace, counting
+/// those that succeeded in `ran`. The first that fails or times out fails
+/// setup.
+async fn run_setup_commands(
+    commands: &[String],
+    target: &Path,
+    ran: &mut usize,
+) -> std::io::Result<()> {
+    for (i, cmd) in commands.iter().enumerate() {
+        if cmd.trim().is_empty() {
+            continue;
+        }
+        tracing::info!(index = i, command = %cmd, dir = %target.display(), "running workspace setup command");
+        let (out, result) =
+            run_setup_command_with_timeout(cmd, target, DEFAULT_SETUP_COMMAND_TIMEOUT).await;
+        if let Err(e) = result {
+            let tail = &out[out.len().saturating_sub(MAX_COMMAND_OUTPUT_IN_ERROR)..];
+            let snippet = String::from_utf8_lossy(tail).replace('\u{FFFD}', "");
+            let snippet = snippet.trim();
+            let msg = if snippet.is_empty() {
+                format!("running setup.commands[{i}] ({cmd:?}): {e}")
+            } else {
+                format!("running setup.commands[{i}] ({cmd:?}): {snippet}: {e}")
+            };
+            return Err(std::io::Error::other(msg));
+        }
+        *ran += 1;
+    }
+    Ok(())
+}
+
+/// Runs one setup command with `sh -c` in `dir`, returning its combined
+/// output. The shell gets its own process group, so a timeout kills
+/// backgrounded children that hold its output open too.
+pub async fn run_setup_command_with_timeout(
+    cmd: &str,
+    dir: &Path,
+    timeout: Duration,
+) -> (Vec<u8>, Result<(), String>) {
+    let child = Command::new("sh")
+        .args(["-c", cmd])
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn();
+    let child = match child {
+        Ok(c) => c,
+        Err(e) => return (Vec::new(), Err(e.to_string())),
+    };
+    let pid = child.id().map_or(0, |p| p as i32);
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(out)) => {
+            let mut combined = out.stdout;
+            combined.extend_from_slice(&out.stderr);
+            let result = if out.status.success() {
+                Ok(())
+            } else {
+                Err(out.status.to_string())
+            };
+            (combined, result)
+        }
+        Ok(Err(e)) => (Vec::new(), Err(e.to_string())),
+        Err(_) => {
+            if pid > 0 {
+                // SAFETY: kill has no memory-safety preconditions.
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+            }
+            (
+                Vec::new(),
+                Err(format!("timed out after {}", humantime(timeout))),
+            )
+        }
+    }
+}
+
+fn humantime(d: Duration) -> String {
+    let s = d.as_secs();
+    match (s / 60, s % 60) {
+        (0, _) if d.subsec_millis() > 0 && s == 0 => format!("{}ms", d.as_millis()),
+        (0, s) => format!("{s}s"),
+        (m, 0) => format!("{m}m0s"),
+        (m, s) => format!("{m}m{s}s"),
+    }
 }
 
 /// The first-run marker's file name for a workspace mounted at `path`. It is
@@ -302,20 +462,14 @@ fn workspace_name(ws: Option<&Workspace>) -> &str {
         .unwrap_or("unknown")
 }
 
-fn write_marker(path: &Path, ws: Option<&Workspace>) {
+fn write_marker(path: &Path, ws: Option<&Workspace>) -> std::io::Result<()> {
     let name = workspace_name(ws);
-    if let Some(dir) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(dir)
-    {
-        tracing::warn!(path = %path.display(), error = %e, "failed to create initialized marker directory");
-        return;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
     }
     let now = chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now())
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let content = format!("workspace: {name}\ninitialized_at: {now}\n");
-    if let Err(e) = std::fs::write(path, content) {
-        tracing::warn!(path = %path.display(), error = %e, "failed to write initialized marker file");
-    }
+    std::fs::write(path, format!("workspace: {name}\ninitialized_at: {now}\n"))
 }
 
 fn write_state_file(ax_dir: &Path, name: &str, data: &[u8]) {
@@ -331,37 +485,67 @@ pub fn repo_dir_name(url: &str) -> String {
     let trimmed = url.trim();
     let trimmed = trimmed.strip_suffix('/').unwrap_or(trimmed);
     let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
-    match trimmed.rfind(['/', ':']) {
-        Some(i) => trimmed[i + 1..].to_owned(),
-        None => trimmed.to_owned(),
+    let name = match trimmed.rfind(['/', ':']) {
+        Some(i) => &trimmed[i + 1..],
+        None => trimmed,
+    };
+    if name == "." || name == ".." {
+        return String::new();
     }
+    name.to_owned()
 }
 
-fn write_files(files: &[File], target: &Path) {
-    for f in files.iter().filter(|f| !f.path.is_empty()) {
-        let dest = if Path::new(&f.path).is_absolute() {
-            PathBuf::from(&f.path)
-        } else {
-            target.join(&f.path)
-        };
-        if let Some(dir) = dest.parent()
-            && let Err(e) = std::fs::create_dir_all(dir)
-        {
-            tracing::warn!(path = %dest.display(), error = %e, "failed to create directory for workspace file");
-            continue;
+/// Writes the inlined files into the workspace. Each path must name a file
+/// within the workspace.
+fn write_files(files: &[File], target: &Path) -> std::io::Result<()> {
+    for f in files.iter().filter(|f| !f.path.trim().is_empty()) {
+        let rel = f.path.as_str();
+        if rel.ends_with('/') || rax_guest::filesystem::clean(Path::new(rel)) == Path::new(".") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("workspace file path {rel:?} must name a file, not a directory"),
+            ));
         }
-        if let Err(e) = std::fs::write(&dest, &f.content) {
-            tracing::warn!(path = %dest.display(), error = %e, "failed to write workspace file");
-            continue;
+        if !is_relative_within_root(rel) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "workspace file path {rel:?} must be relative to workspace {}",
+                    target.display()
+                ),
+            ));
         }
+        let dest = target.join(rel);
+        if let Some(dir) = dest.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| {
+                wrap(
+                    e,
+                    &format!("creating directory for workspace file {}", dest.display()),
+                )
+            })?;
+        }
+        std::fs::write(&dest, &f.content)
+            .map_err(|e| wrap(e, &format!("writing workspace file {}", dest.display())))?;
         tracing::info!(path = %dest.display(), "wrote inlined workspace file");
     }
+    Ok(())
+}
+
+/// Whether `p` is a relative path that stays within the directory it is
+/// relative to.
+fn is_relative_within_root(p: &str) -> bool {
+    if Path::new(p).is_absolute() {
+        return false;
+    }
+    let clean = rax_guest::filesystem::clean(Path::new(p));
+    let clean = clean.to_string_lossy();
+    clean != ".." && !clean.starts_with("../")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rax_api::v1alpha1::{ObjectMeta, WorkspaceSpec};
+    use rax_api::v1alpha1::{ObjectMeta, WorkspaceSetup, WorkspaceSpec};
 
     fn workspace(name: &str, spec: WorkspaceSpec) -> Workspace {
         Workspace {
@@ -396,8 +580,11 @@ mod tests {
         let ws = workspace(
             "test-ws",
             WorkspaceSpec {
-                skills: Some(SkillsConfig {
-                    path: tmp.path().join("skills").display().to_string(),
+                setup: Some(WorkspaceSetup {
+                    skills: Some(SkillsConfig {
+                        path: tmp.path().join("skills").display().to_string(),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -434,12 +621,15 @@ mod tests {
         let ws = workspace(
             "git-ws",
             WorkspaceSpec {
-                git: vec![GitRepo {
-                    name: "ax".into(),
-                    repo: src.path().display().to_string(),
-                    depth: 1,
+                setup: Some(WorkspaceSetup {
+                    git: vec![GitRepo {
+                        name: "ax".into(),
+                        repo: src.path().display().to_string(),
+                        depth: 1,
+                        ..Default::default()
+                    }],
                     ..Default::default()
-                }],
+                }),
                 ..Default::default()
             },
         );
@@ -464,17 +654,22 @@ mod tests {
         let ws = workspace(
             "bad",
             WorkspaceSpec {
-                git: vec![GitRepo {
-                    name: "invalid-repo".into(),
-                    repo: tmp.path().join("missing-repo").display().to_string(),
+                setup: Some(WorkspaceSetup {
+                    git: vec![GitRepo {
+                        name: "invalid-repo".into(),
+                        repo: tmp.path().join("missing-repo").display().to_string(),
+                        ..Default::default()
+                    }],
                     ..Default::default()
-                }],
+                }),
                 ..Default::default()
             },
         );
         let target = tmp.path().to_str().unwrap();
-        let res = setup_workspace(Some(&ws), target, &state).await.unwrap();
-        assert!(res.cloned_repos.is_empty());
+        let err = setup_workspace(Some(&ws), target, &state)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("missing-repo (ref main)"), "{err}");
         assert!(state.join(GIT_ERROR_LOG).exists());
         assert!(
             !tmp.path()
@@ -487,20 +682,16 @@ mod tests {
     #[tokio::test]
     async fn writes_inlined_files() {
         let tmp = tempfile::tempdir().unwrap();
-        let abs = tmp.path().join("abs.txt");
         let ws = workspace(
             "files-ws",
             WorkspaceSpec {
-                files: vec![
-                    File {
+                setup: Some(WorkspaceSetup {
+                    files: vec![File {
                         path: "config/settings.json".into(),
                         content: r#"{"env": "production"}"#.into(),
-                    },
-                    File {
-                        path: abs.display().to_string(),
-                        content: "absolute".into(),
-                    },
-                ],
+                    }],
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         );
@@ -516,7 +707,222 @@ mod tests {
             std::fs::read_to_string(ws_dir.join("config/settings.json")).unwrap(),
             r#"{"env": "production"}"#
         );
-        assert_eq!(std::fs::read_to_string(abs).unwrap(), "absolute");
+    }
+
+    fn setup_ws(name: &str, setup: WorkspaceSetup) -> Workspace {
+        workspace(
+            name,
+            WorkspaceSpec {
+                setup: Some(setup),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Paths that leave the workspace, and file paths naming directories,
+    /// fail setup.
+    #[tokio::test]
+    async fn rejects_escaping_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let file = |p: &str| WorkspaceSetup {
+            files: vec![File {
+                path: p.into(),
+                content: "x".into(),
+            }],
+            ..Default::default()
+        };
+        let skills = |p: &str| WorkspaceSetup {
+            skills: Some(SkillsConfig {
+                path: p.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cases = [
+            (file("../escape.txt"), "must be relative"),
+            (file("/etc/passwd"), "must be relative"),
+            (file("."), "must name a file"),
+            (file("dir/"), "must name a file"),
+            (skills("../skills"), "escapes workspace"),
+        ];
+        for (i, (setup, want)) in cases.into_iter().enumerate() {
+            let target = tmp.path().join(format!("ws-{i}"));
+            let err = setup_workspace(
+                Some(&setup_ws("esc", setup)),
+                target.to_str().unwrap(),
+                &state,
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains(want), "{err}");
+            assert!(!workspace_marker_path(&target).exists());
+        }
+        assert!(!tmp.path().join("escape.txt").exists());
+    }
+
+    /// Skill registries without a path get .ax/skills; a relative path is
+    /// under the workspace.
+    #[tokio::test]
+    async fn skills_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let registries = vec![rax_api::v1alpha1::SkillRegistry::default()];
+        for (path, regs, want) in [
+            ("", registries.clone(), Some(".ax/skills")),
+            ("", vec![], None),
+            ("my-skills", vec![], Some("my-skills")),
+        ] {
+            let target = tmp.path().join(format!("ws-{path}-{}", regs.len()));
+            let setup = WorkspaceSetup {
+                skills: Some(SkillsConfig {
+                    path: path.into(),
+                    registries: regs,
+                }),
+                ..Default::default()
+            };
+            let res = setup_workspace(
+                Some(&setup_ws("skills", setup)),
+                target.to_str().unwrap(),
+                &state,
+            )
+            .await
+            .unwrap();
+            match want {
+                Some(rel) => {
+                    assert_eq!(res.skills_mounted, target.join(rel).display().to_string());
+                    assert!(target.join(rel).is_dir());
+                }
+                None => assert_eq!(res.skills_mounted, ""),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn runs_setup_commands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let ok = tmp.path().join("ok");
+        let res = setup_workspace(
+            Some(&setup_ws(
+                "cmd-ok",
+                WorkspaceSetup {
+                    files: vec![File {
+                        path: "deps.txt".into(),
+                        content: "pkg-a\n".into(),
+                    }],
+                    commands: vec![
+                        "cat deps.txt > installed.txt".into(),
+                        " ".into(),
+                        "echo done >> installed.txt".into(),
+                    ],
+                    ..Default::default()
+                },
+            )),
+            ok.to_str().unwrap(),
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.commands_run, 2);
+        assert_eq!(
+            std::fs::read_to_string(ok.join("installed.txt")).unwrap(),
+            "pkg-a\ndone\n"
+        );
+
+        let fail = tmp.path().join("fail");
+        let err = setup_workspace(
+            Some(&setup_ws(
+                "cmd-fail",
+                WorkspaceSetup {
+                    commands: vec!["echo boom >&2 && exit 7".into()],
+                    ..Default::default()
+                },
+            )),
+            fail.to_str().unwrap(),
+            &state,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("setup.commands[0]"), "{err}");
+        assert!(err.to_string().contains("boom"), "{err}");
+        assert!(!workspace_marker_path(&fail).exists());
+    }
+
+    /// A timed-out command is killed with its whole group, so a background
+    /// child holding the output open does not hang setup.
+    #[tokio::test]
+    async fn setup_command_timeout_kills_the_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let start = std::time::Instant::now();
+        let (_, result) = run_setup_command_with_timeout(
+            "sleep 30 & sleep 30",
+            tmp.path(),
+            Duration::from_millis(200),
+        )
+        .await;
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    /// A ref can be a branch, a tag or a commit SHA, full or abbreviated.
+    #[tokio::test]
+    async fn checks_out_branch_tag_and_sha() {
+        let src = tempfile::tempdir().unwrap();
+        git(
+            src.path(),
+            &format!(
+                "{INIT} && echo one > f.txt && git add . && git commit -qm one && git tag v1 \
+                 && git checkout -qb feature && echo two > f.txt && git commit -qam two \
+                 && git checkout -q main && echo three > f.txt && git commit -qam three"
+            ),
+        );
+        let sha = |rev: &str| {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", rev])
+                .current_dir(src.path())
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        let one = sha("v1");
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        for (i, (r#ref, want)) in [
+            ("", "three"),
+            ("feature", "two"),
+            ("v1", "one"),
+            (one.as_str(), "one"),
+            (&one[..10], "one"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let target = tmp.path().join(format!("ws-{i}"));
+            let setup = WorkspaceSetup {
+                git: vec![GitRepo {
+                    name: "src".into(),
+                    repo: src.path().display().to_string(),
+                    r#ref: r#ref.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            setup_workspace(
+                Some(&setup_ws("refs", setup)),
+                target.to_str().unwrap(),
+                &state,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("ref {ref:?}: {e}"));
+            assert_eq!(
+                std::fs::read_to_string(target.join("src/f.txt"))
+                    .unwrap()
+                    .trim(),
+                want,
+                "ref {ref:?}"
+            );
+        }
     }
 
     /// A repository cloned into the workspace root takes the marker into its
@@ -534,12 +940,15 @@ mod tests {
         let ws = workspace(
             "root-clone-ws",
             WorkspaceSpec {
-                git: vec![GitRepo {
-                    name: "root".into(),
-                    repo: src.path().display().to_string(),
-                    dir: ".".into(),
+                setup: Some(WorkspaceSetup {
+                    git: vec![GitRepo {
+                        name: "root".into(),
+                        repo: src.path().display().to_string(),
+                        dir: ".".into(),
+                        ..Default::default()
+                    }],
                     ..Default::default()
-                }],
+                }),
                 ..Default::default()
             },
         );
@@ -567,10 +976,13 @@ mod tests {
         workspace(
             name,
             WorkspaceSpec {
-                files: vec![File {
-                    path: "x.txt".into(),
-                    content: "x".into(),
-                }],
+                setup: Some(WorkspaceSetup {
+                    files: vec![File {
+                        path: "x.txt".into(),
+                        content: "x".into(),
+                    }],
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         )
@@ -702,7 +1114,6 @@ mod tests {
         };
         for (r, want) in [
             (repo("x", "u", "."), "/workspace"),
-            (repo("x", "u", "/opt/src"), "/opt/src"),
             (repo("x", "u", "sub/dir"), "/workspace/sub/dir"),
             (repo("tools", "https://h/a/b.git", ""), "/workspace/tools"),
             (
@@ -715,7 +1126,14 @@ mod tests {
             ),
             (repo("", "", ""), "/workspace/repo"),
         ] {
-            assert_eq!(clone_destination(&r, t), PathBuf::from(want), "{r:?}");
+            assert_eq!(
+                clone_destination(&r, t).unwrap(),
+                PathBuf::from(want),
+                "{r:?}"
+            );
+        }
+        for dir in ["/opt/src", "../up", "a/../../b"] {
+            assert!(clone_destination(&repo("x", "u", dir), t).is_err(), "{dir}");
         }
     }
 }

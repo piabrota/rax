@@ -36,6 +36,15 @@ pub mod substrate {
     }
 }
 
+pub mod google {
+    //! googleapis' `google.rpc.Status`, which a task's outcome carries.
+    pub mod rpc {
+        #![allow(clippy::all)]
+        include!(concat!(env!("OUT_DIR"), "/substrate/google.rpc.rs"));
+        include!(concat!(env!("OUT_DIR"), "/substrate/google.rpc.serde.rs"));
+    }
+}
+
 pub use resources::{
     MAX_CPU_LIMIT_CORES, parse_cpu_millicores, parse_memory_bytes, validate_resources,
 };
@@ -58,32 +67,43 @@ pub const KIND_GATEWAY: &str = "Gateway";
 pub const DEFAULT_TASK_IMAGE: &str = "gcr.io/ax-substrate/ate-images/ax-task-runner";
 pub const DEFAULT_SYSTEM_NAMESPACE: &str = "ax-system";
 
-/// Task phases.
-///
-/// `PENDING`, `FAILED` and `TERMINATING` describe the control plane's own work
-/// and are the only phases stored. The rest follow from the state of the
-/// task's actor on Agent Substrate and are read from it whenever a task is
-/// fetched.
-pub mod phase {
-    /// The actor has not been provisioned yet, for example because Substrate
-    /// was unavailable. Retrying can still succeed.
-    pub const PENDING: &str = "Pending";
-    /// AX could not provision or operate the task, or its actor crashed or
-    /// disappeared.
-    pub const FAILED: &str = "Failed";
-    /// Deletion was requested and the actor is being torn down.
-    pub const TERMINATING: &str = "Terminating";
-    pub const RUNNING: &str = "Running";
-    pub const RESUMING: &str = "Resuming";
-    pub const SUSPENDING: &str = "Suspending";
-    pub const SUSPENDED: &str = "Suspended";
-    /// The actor could not be read, or is in a state AX does not recognize.
-    pub const UNKNOWN: &str = "Unknown";
+pub const DEFAULT_ATESPACE: &str = "default";
 
-    /// Reports whether `phase` describes AX's own work on a task rather than
-    /// the state of its actor. Only these phases are stored.
-    pub fn is_ax_phase(phase: &str) -> bool {
-        matches!(phase, PENDING | FAILED | TERMINATING)
+/// The file in a task's sandbox that holds the CA certificates to trust for
+/// outbound TLS, including the egress gateway's.
+pub const EGRESS_TRUST_BUNDLE_PATH: &str = "/run/ate/egress-trust-bundle/trust-bundle.pem";
+
+/// Reports whether `state` is one of the control plane's own stored task
+/// states (queued for provisioning or retry, or terminal) rather than one
+/// read from the task's actor on Agent Substrate. Only these are stored.
+pub fn is_ax_task_state(state: v1alpha1::TaskState) -> bool {
+    use v1alpha1::TaskState as S;
+    matches!(state, S::Queued | S::Completed | S::Failed | S::Cancelled)
+}
+
+/// A task's state as the CLI shows it. A task whose deletion is in progress
+/// (metadata.deleteTime set) is "Terminating".
+pub fn format_task_state(task: &v1alpha1::Task) -> &'static str {
+    use v1alpha1::TaskState as S;
+    if task
+        .metadata
+        .as_ref()
+        .is_some_and(|m| m.delete_time.is_some())
+    {
+        return reason::TERMINATING;
+    }
+    let state = task.status.as_ref().map_or(S::Unspecified, |s| s.state());
+    match state {
+        S::Idle => "Idle",
+        S::Working => "Working",
+        S::RequiresAction => "RequiresAction",
+        S::Completed => "Completed",
+        S::Failed => "Failed",
+        S::Cancelled => "Cancelled",
+        S::Queued => "Queued",
+        S::Suspended => "Suspended",
+        S::Suspending => "Suspending",
+        S::Unspecified => reason::UNKNOWN,
     }
 }
 
@@ -95,8 +115,7 @@ pub mod condition {
     pub const WORKSPACE_READY: &str = "WorkspaceReady";
 }
 
-/// Condition reasons. A Ready condition that is False because the actor is not
-/// running (for example while it is suspended) uses the task's phase instead.
+/// Condition reasons reported on Ready and WorkspaceReady conditions.
 pub mod reason {
     pub const TASK_RUNNING: &str = "TaskRunning";
     pub const WORKSPACE_INITIALIZING: &str = "WorkspaceInitializing";
@@ -106,7 +125,15 @@ pub mod reason {
     pub const INVALID_RESOURCES: &str = "InvalidResources";
     pub const TEMPLATE_CREATION_FAILED: &str = "TemplateCreationFailed";
     pub const ACTOR_CREATION_FAILED: &str = "ActorCreationFailed";
+    pub const GATEWAY_BINDING_FAILED: &str = "GatewayBindingFailed";
     pub const ACTOR_RESUME_FAILED: &str = "ActorResumeFailed";
+    // Reported on Ready when the actor is not running.
+    pub const RESUMING: &str = "Resuming";
+    pub const SUSPENDING: &str = "Suspending";
+    pub const SUSPENDED: &str = "Suspended";
+    pub const FAILED: &str = "Failed";
+    pub const TERMINATING: &str = "Terminating";
+    pub const UNKNOWN: &str = "Unknown";
     pub const SETUP_COMPLETE: &str = "SetupComplete";
     pub const INITIALIZING: &str = "Initializing";
 }

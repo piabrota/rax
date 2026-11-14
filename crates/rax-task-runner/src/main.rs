@@ -52,6 +52,7 @@ fn fatal(err: impl std::fmt::Display) -> ! {
 
 #[tokio::main]
 async fn main() {
+    runner::answer_git_askpass();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

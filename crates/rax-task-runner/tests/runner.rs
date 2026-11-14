@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rax_api::v1alpha1::{
-    EnvVar, ObjectMeta, Task, TaskSpec, Workspace, WorkspaceRef, WorkspaceSpec,
+    EnvVar, ObjectMeta, Profile, Task, TaskSpec, Workspace, WorkspaceRef, WorkspaceSetup,
+    WorkspaceSpec,
 };
 use rax_guest::{Client, ExecOptions};
 use rax_task_runner::metadata::{Server, ServerOptions};
@@ -78,6 +79,7 @@ struct Harness {
     metadata_port: u16,
     task: Task,
     workspace: Option<Workspace>,
+    ca_bundle: Option<PathBuf>,
     stop: Option<oneshot::Sender<()>>,
     finished: Option<tokio::task::JoinHandle<Result<(), String>>>,
     exited: Option<mpsc::Receiver<CommandExit>>,
@@ -95,6 +97,7 @@ impl Harness {
             port: free_port(),
             metadata_port: free_port(),
             workspace: None,
+            ca_bundle: None,
             stop: None,
             finished: None,
             exited: None,
@@ -114,6 +117,7 @@ impl Harness {
             task: Some(self.task.clone()),
             workspace: self.workspace.clone(),
             ax_dir: Some(self.ax_dir.clone()),
+            ca_bundle: self.ca_bundle.clone(),
             on_command_exit: Some(Box::new(move |e| {
                 let _ = exit_tx.try_send(e);
             })),
@@ -168,7 +172,7 @@ async fn starts_command_with_injected_env() {
         name: "DEMO_ENV".into(),
         value: "from-task".into(),
     }];
-    h.spec().command = vec![
+    h.spec().commands = vec![
         "sh".into(),
         "-c".into(),
         format!(
@@ -193,7 +197,7 @@ async fn starts_command_with_injected_env() {
 #[tokio::test]
 async fn reports_exit_code_and_keeps_serving() {
     let mut h = Harness::new();
-    h.spec().command = vec!["sh".into(), "-c".into(), "exit 3".into()];
+    h.spec().commands = vec!["sh".into(), "-c".into(), "exit 3".into()];
     h.start().await;
     let exit = h.wait_exit().await;
     assert_eq!(exit.exit_code, 3);
@@ -207,7 +211,7 @@ async fn reports_exit_code_and_keeps_serving() {
 #[tokio::test]
 async fn stops_running_command_group_on_shutdown() {
     let mut h = Harness::new();
-    h.spec().command = vec!["sh".into(), "-c".into(), "sleep 30; sleep 30".into()];
+    h.spec().commands = vec!["sh".into(), "-c".into(), "sleep 30; sleep 30".into()];
     h.start().await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     h.stop().await;
@@ -222,6 +226,114 @@ async fn without_command_waits_for_shutdown() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(h.is_running());
     h.stop().await;
+}
+
+#[tokio::test]
+async fn sets_default_env() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bundle = tmp.path().join("trust-bundle.pem");
+    std::fs::write(&bundle, "").unwrap();
+    let b = bundle.display().to_string();
+    for (ca_bundle, env, want) in [
+        (bundle.clone(), vec![], format!("{b}|{b}|0|git-askpass")),
+        (
+            bundle.with_extension("missing"),
+            vec![],
+            // Without the bundle the runner's own variables pass through.
+            format!(
+                "{}|{}|0|git-askpass",
+                std::env::var("SSL_CERT_FILE").unwrap_or_default(),
+                std::env::var("GIT_SSL_CAINFO").unwrap_or_default()
+            ),
+        ),
+        (
+            bundle.clone(),
+            vec![
+                ("SSL_CERT_FILE", "/task/ca.pem"),
+                ("GIT_ASKPASS", "/bin/true"),
+            ],
+            format!("/task/ca.pem|{b}|0|true"),
+        ),
+    ] {
+        let mut h = Harness::new();
+        // A link left by an earlier run is replaced.
+        std::fs::create_dir_all(&h.ax_dir).unwrap();
+        std::os::unix::fs::symlink("/stale", h.ax_dir.join(runner::GIT_ASKPASS)).unwrap();
+        let out = h.ws_path.with_file_name("out.txt");
+        h.ca_bundle = Some(ca_bundle);
+        h.spec().env = env
+            .iter()
+            .map(|(n, v)| EnvVar {
+                name: n.to_string(),
+                value: v.to_string(),
+            })
+            .collect();
+        h.spec().commands = vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "echo \"$SSL_CERT_FILE|$GIT_SSL_CAINFO|$GIT_TERMINAL_PROMPT|$(basename \"$GIT_ASKPASS\")\" > {}",
+                out.display()
+            ),
+        ];
+        h.start().await;
+        assert_eq!(h.wait_exit().await.error, None);
+        assert_eq!(std::fs::read_to_string(&out).unwrap().trim(), want);
+        if env.is_empty() {
+            let link = std::fs::read_link(h.ax_dir.join(runner::GIT_ASKPASS)).unwrap();
+            assert_ne!(link, Path::new("/stale"));
+        }
+        h.stop().await;
+    }
+}
+
+/// Started as `git-askpass`, the runner answers git with the placeholder.
+#[test]
+fn answers_git_askpass() {
+    let tmp = tempfile::tempdir().unwrap();
+    let link = tmp.path().join(runner::GIT_ASKPASS);
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_rax-task-runner"), &link).unwrap();
+    let out = std::process::Command::new(&link)
+        .arg("Password for 'https://git.example': ")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\n", runner::GIT_ASKPASS_PLACEHOLDER)
+    );
+}
+
+#[tokio::test]
+async fn setup_failure_aborts_before_starting_command() {
+    let mut h = Harness::new();
+    let ran = h.ws_path.with_file_name("command-ran");
+    h.workspace = Some(Workspace {
+        metadata: Some(ObjectMeta {
+            name: "ws".into(),
+            ..Default::default()
+        }),
+        spec: Some(WorkspaceSpec {
+            setup: Some(WorkspaceSetup {
+                commands: vec!["echo setup-boom >&2 && exit 9".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    h.spec().commands = vec!["sh".into(), "-c".into(), format!("touch {}", ran.display())];
+    let cfg = Config {
+        port: h.port,
+        metadata_port: h.metadata_port,
+        task: Some(h.task.clone()),
+        workspace: h.workspace.clone(),
+        ax_dir: Some(h.ax_dir.clone()),
+        ..Default::default()
+    };
+    let err = runner::run(cfg, std::future::pending()).await.unwrap_err();
+    assert!(err.contains("setup-boom"), "{err}");
+    assert!(!ran.exists(), "the command started although setup failed");
 }
 
 #[tokio::test]
@@ -241,7 +353,7 @@ async fn sets_up_bound_workspace() {
         spec: Some(WorkspaceSpec::default()),
         ..Default::default()
     });
-    h.spec().command = vec!["sh".into(), "-c".into(), format!("pwd > {}", out.display())];
+    h.spec().commands = vec!["sh".into(), "-c".into(), format!("pwd > {}", out.display())];
     h.start().await;
     assert_eq!(h.wait_exit().await.exit_code, 0);
     assert!(code.is_dir());
@@ -270,7 +382,10 @@ fn sample_task(debug: bool) -> Task {
     let mut t = task("task123", Path::new("/workspace"));
     let spec = t.spec.as_mut().unwrap();
     spec.workspace = None;
-    spec.image = "ghcr.io/test/img".into();
+    spec.profile = Some(Profile {
+        image: "ghcr.io/test/img".into(),
+        ..Default::default()
+    });
     spec.debug = debug;
     t
 }

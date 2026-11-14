@@ -172,7 +172,7 @@ fn with_claude_command_only_fills_an_empty_command() {
 
     let explicit = Task {
         spec: Some(TaskSpec {
-            command: vec!["make".into(), "test".into()],
+            commands: vec!["make".into(), "test".into()],
             config: Some(cfg.clone()),
             ..Default::default()
         }),
@@ -214,7 +214,7 @@ fn with_claude_command_only_fills_an_empty_command() {
         ..Default::default()
     };
     let got = with_claude_command(task, Some(&ws)).unwrap();
-    let cmd = &got.spec.unwrap().command;
+    let cmd = &got.spec.unwrap().commands;
     assert_eq!(cmd[0], CLAUDE_BINARY);
     assert!(
         cmd.iter().any(|a| a.starts_with("--mcp-config=")),

@@ -13,7 +13,7 @@ mod memory;
 mod postgres;
 
 use async_trait::async_trait;
-use rax_api::v1alpha1::{Gateway, Model, ObjectMeta, Task, TaskStatus, Workspace};
+use rax_api::v1alpha1::{Gateway, Model, ObjectMeta, Task, TaskState, TaskStatus, Workspace};
 
 pub use lock::{LockGuard, Locker, MemoryLocker, lock_key};
 pub use memory::MemoryStore;
@@ -22,8 +22,8 @@ pub use postgres::{PostgresOptions, PostgresStore, describe_url};
 /// The atespace a resource lands in when it names none.
 pub const DEFAULT_ATESPACE: &str = "default";
 
-/// How many tasks a list returns when the caller sets no limit.
-pub const DEFAULT_TASK_LIST_LIMIT: i64 = 50;
+/// How many tasks or workspaces a list returns when the caller sets no limit.
+pub const DEFAULT_PAGE_LIMIT: i64 = 50;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -41,13 +41,14 @@ pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 /// strip the actor-owned status before writing and fill it in after reading.
 #[async_trait]
 pub trait TaskStore: Send + Sync {
-    /// Stores or replaces a task, filling in its atespace, apiVersion, kind and
-    /// a Pending phase when they are unset.
+    /// Stores or replaces a task, filling in its atespace, apiVersion and kind
+    /// when they are unset, and state Queued when it has none and is not being
+    /// deleted.
     async fn save_task(&self, task: &mut Task) -> Result<()>;
     async fn get_task(&self, atespace: &str, name: &str) -> Result<Task>;
     /// Lists tasks in an atespace, or across all of them when `atespace` is
     /// empty or `*`, most recently saved first. A `limit` of zero or less
-    /// means [`DEFAULT_TASK_LIST_LIMIT`].
+    /// means [`DEFAULT_PAGE_LIMIT`].
     async fn list_tasks(&self, atespace: &str, limit: i64, offset: i64) -> Result<Vec<Task>>;
     /// Replaces only the status of a task. It does not change the task's
     /// position in lists.
@@ -56,6 +57,14 @@ pub trait TaskStore: Send + Sync {
         atespace: &str,
         name: &str,
         status: TaskStatus,
+    ) -> Result<()>;
+    /// Sets or clears metadata.deleteTime on a task. Like a status update, it
+    /// does not change the task's position in lists.
+    async fn set_task_delete_time(
+        &self,
+        atespace: &str,
+        name: &str,
+        delete_time: Option<pbjson_types::Timestamp>,
     ) -> Result<()>;
     /// Removes a task. Deleting a missing task is not an error.
     async fn delete_task(&self, atespace: &str, name: &str) -> Result<()>;
@@ -67,8 +76,14 @@ pub trait ResourceStore: Send + Sync {
     async fn save_workspace(&self, ws: &mut Workspace) -> Result<()>;
     async fn get_workspace(&self, atespace: &str, name: &str) -> Result<Workspace>;
     /// Lists workspaces in an atespace, or across all of them when `atespace`
-    /// is empty or `*`, most recently saved first.
-    async fn list_workspaces(&self, atespace: &str) -> Result<Vec<Workspace>>;
+    /// is empty or `*`, most recently saved first. A `limit` of zero or less
+    /// means [`DEFAULT_PAGE_LIMIT`].
+    async fn list_workspaces(
+        &self,
+        atespace: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Workspace>>;
     async fn delete_workspace(&self, atespace: &str, name: &str) -> Result<()>;
 
     async fn save_gateway(&self, gw: &mut Gateway) -> Result<()>;
@@ -128,9 +143,13 @@ fn default_type(api_version: &mut String, kind: &mut String, want_kind: &str) {
 pub(crate) fn prepare_task(task: &mut Task) -> Result<()> {
     default_meta(&mut task.metadata, "task")?;
     default_type(&mut task.api_version, &mut task.kind, rax_api::KIND_TASK);
+    let deleting = task
+        .metadata
+        .as_ref()
+        .is_some_and(|m| m.delete_time.is_some());
     let status = task.status.get_or_insert_with(Default::default);
-    if status.phase.is_empty() {
-        status.phase = rax_api::phase::PENDING.into();
+    if status.state() == TaskState::Unspecified && !deleting {
+        status.set_state(TaskState::Queued);
     }
     Ok(())
 }
@@ -153,6 +172,14 @@ pub(crate) fn prepare_model(model: &mut Model) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn page_limit(limit: i64) -> i64 {
+    if limit <= 0 {
+        DEFAULT_PAGE_LIMIT
+    } else {
+        limit
+    }
+}
+
 pub(crate) fn meta_key(meta: &Option<ObjectMeta>) -> (String, String) {
     let m = meta.as_ref().expect("prepared resources have metadata");
     (m.atespace.clone(), m.name.clone())
@@ -163,17 +190,20 @@ pub(crate) mod testing {
     //! Behavior every backend must share, run against each of them.
 
     use super::*;
-    use rax_api::v1alpha1::{Condition, TaskSpec};
+    use rax_api::v1alpha1::{Condition, Profile, TaskSpec};
 
     pub fn task(atespace: &str, name: &str) -> Task {
         Task {
             metadata: Some(ObjectMeta {
                 name: name.into(),
                 atespace: atespace.into(),
-                create_time: None,
+                ..Default::default()
             }),
             spec: Some(TaskSpec {
-                image: "alpine".into(),
+                profile: Some(Profile {
+                    image: "alpine".into(),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -195,7 +225,7 @@ pub(crate) mod testing {
         assert_eq!(got.metadata.as_ref().unwrap().atespace, "default");
         assert_eq!(got.api_version, rax_api::API_VERSION);
         assert_eq!(got.kind, rax_api::KIND_TASK);
-        assert_eq!(got.status.as_ref().unwrap().phase, rax_api::phase::PENDING);
+        assert_eq!(got.status.as_ref().unwrap().state(), TaskState::Queued);
         assert_eq!(got, t);
         // An empty atespace on reads means the default one.
         assert_eq!(s.get_task("", "a").await.unwrap(), t);
@@ -219,7 +249,7 @@ pub(crate) mod testing {
         assert_eq!(names(&list, |t| &t.metadata), ["c", "b", "a"]);
         s.save_task(&mut task("default", "a")).await.unwrap();
         let status = TaskStatus {
-            id: "id-b".into(),
+            attempt: 2,
             conditions: vec![Condition {
                 r#type: "WorkspaceReady".into(),
                 status: "True".into(),
@@ -247,6 +277,35 @@ pub(crate) mod testing {
                 .await,
             Err(StoreError::NotFound)
         ));
+
+        // Setting and clearing the delete time keeps the status and the
+        // task's place in lists.
+        let when = pbjson_types::Timestamp {
+            seconds: 1_790_000_000,
+            nanos: 0,
+        };
+        s.set_task_delete_time("default", "b", Some(when))
+            .await
+            .unwrap();
+        let got = s.get_task("default", "b").await.unwrap();
+        assert_eq!(got.metadata.as_ref().unwrap().delete_time, Some(when));
+        assert_eq!(got.status.as_ref(), Some(&status));
+        let list = s.list_tasks("default", 0, 0).await.unwrap();
+        assert_eq!(names(&list, |t| &t.metadata), ["a", "c", "b"]);
+        s.set_task_delete_time("default", "b", None).await.unwrap();
+        let got = s.get_task("default", "b").await.unwrap();
+        assert_eq!(got.metadata.as_ref().unwrap().delete_time, None);
+        assert!(matches!(
+            s.set_task_delete_time("default", "missing", None).await,
+            Err(StoreError::NotFound)
+        ));
+        // A task saved while being deleted gets no Queued state.
+        let mut deleting = task("default", "deleting");
+        deleting.metadata.as_mut().unwrap().delete_time = Some(pbjson_types::Timestamp::default());
+        s.save_task(&mut deleting).await.unwrap();
+        let got = s.get_task("default", "deleting").await.unwrap();
+        assert_eq!(got.status.as_ref().unwrap().state(), TaskState::Unspecified);
+        s.delete_task("default", "deleting").await.unwrap();
 
         s.delete_task("default", "a").await.unwrap();
         s.delete_task("default", "a").await.unwrap();
@@ -276,13 +335,21 @@ pub(crate) mod testing {
         };
         s.save_workspace(&mut ws2).await.unwrap();
         assert_eq!(
-            names(&s.list_workspaces("").await.unwrap(), |w| &w.metadata),
+            names(&s.list_workspaces("", 0, 0).await.unwrap(), |w| &w.metadata),
             ["ws2", "ws"]
         );
         assert_eq!(
-            names(&s.list_workspaces("team").await.unwrap(), |w| &w.metadata),
+            names(&s.list_workspaces("team", 0, 0).await.unwrap(), |w| &w
+                .metadata),
             ["ws2"]
         );
+        // Pagination.
+        assert_eq!(
+            names(&s.list_workspaces("*", 1, 1).await.unwrap(), |w| &w
+                .metadata),
+            ["ws"]
+        );
+        assert!(s.list_workspaces("*", 1, 5).await.unwrap().is_empty());
         s.delete_workspace("team", "ws2").await.unwrap();
         assert!(matches!(
             s.get_workspace("team", "ws2").await,

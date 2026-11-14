@@ -1763,6 +1763,8 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -1786,6 +1788,8 @@ dependencies = [
  "opentelemetry_sdk",
  "pbjson-types",
  "prometheus",
+ "prost",
+ "rand 0.9.5",
  "rax-api",
  "rax-otelenv",
  "rax-store",
@@ -1809,6 +1813,7 @@ dependencies = [
  "async-trait",
  "deadpool-postgres",
  "hex",
+ "pbjson-types",
  "rand 0.9.5",
  "rax-api",
  "serde_json",
@@ -1832,6 +1837,7 @@ dependencies = [
  "protox",
  "rand 0.9.5",
  "rax-api",
+ "rax-otelenv",
  "rax-substrate",
  "rcgen",
  "rustls",

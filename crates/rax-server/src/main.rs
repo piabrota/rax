@@ -68,7 +68,7 @@ struct Args {
     #[arg(long, default_value = rax_api::DEFAULT_SYSTEM_NAMESPACE)]
     template_atespace: String,
 
-    /// Container image for tasks that do not set spec.image.
+    /// Container image for tasks that do not set spec.profile.image.
     #[arg(long, env = "AX_DEFAULT_TASK_IMAGE", default_value = rax_api::DEFAULT_TASK_IMAGE)]
     default_task_image: String,
 

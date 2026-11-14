@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use rax_api::v1alpha1::{Gateway, Model, Task, TaskStatus, Workspace};
 
 use crate::{
-    DEFAULT_TASK_LIST_LIMIT, ResourceStore, Result, StoreError, TaskStore, all_atespaces,
-    default_atespace, meta_key, prepare_gateway, prepare_model, prepare_task, prepare_workspace,
+    ResourceStore, Result, StoreError, TaskStore, all_atespaces, default_atespace, meta_key,
+    page_limit, prepare_gateway, prepare_model, prepare_task, prepare_workspace,
 };
 
 type Key = (String, String);
@@ -110,12 +110,7 @@ impl TaskStore for MemoryStore {
     }
 
     async fn list_tasks(&self, atespace: &str, limit: i64, offset: i64) -> Result<Vec<Task>> {
-        let limit = if limit <= 0 {
-            DEFAULT_TASK_LIST_LIMIT
-        } else {
-            limit
-        };
-        Ok(self.with(|s| s.tasks.list(atespace, limit, offset)))
+        Ok(self.with(|s| s.tasks.list(atespace, page_limit(limit), offset)))
     }
 
     async fn update_task_status(
@@ -128,6 +123,22 @@ impl TaskStore for MemoryStore {
             let key = (default_atespace(atespace).to_owned(), name.to_owned());
             let (_, task) = s.tasks.rows.get_mut(&key).ok_or(StoreError::NotFound)?;
             task.status = Some(status);
+            Ok(())
+        })
+    }
+
+    async fn set_task_delete_time(
+        &self,
+        atespace: &str,
+        name: &str,
+        delete_time: Option<pbjson_types::Timestamp>,
+    ) -> Result<()> {
+        self.with(|s| {
+            let key = (default_atespace(atespace).to_owned(), name.to_owned());
+            let (_, task) = s.tasks.rows.get_mut(&key).ok_or(StoreError::NotFound)?;
+            task.metadata
+                .get_or_insert_with(Default::default)
+                .delete_time = delete_time;
             Ok(())
         })
     }
@@ -154,8 +165,13 @@ impl ResourceStore for MemoryStore {
         self.with(|s| s.workspaces.get(atespace, name))
     }
 
-    async fn list_workspaces(&self, atespace: &str) -> Result<Vec<Workspace>> {
-        Ok(self.with(|s| s.workspaces.list(atespace, 0, 0)))
+    async fn list_workspaces(
+        &self,
+        atespace: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Workspace>> {
+        Ok(self.with(|s| s.workspaces.list(atespace, page_limit(limit), offset)))
     }
 
     async fn delete_workspace(&self, atespace: &str, name: &str) -> Result<()> {

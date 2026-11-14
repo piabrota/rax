@@ -3,9 +3,9 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use rax_api::phase;
 use rax_api::v1alpha1::{
-    self as api, Gateway, ObjectMeta, Task, TaskStatus, Workspace, ax_server::Ax,
+    self as api, Gateway, ObjectMeta, StatusDetail, Task, TaskSpec, TaskState, TaskStatus,
+    TaskStatusReason, Workspace, WorkspaceSpec, ax_server::Ax,
 };
 use rax_store::{DEFAULT_ATESPACE, Locker, MemoryLocker, ResourceStore, Store, StoreError};
 use tonic::{Request, Response, Status};
@@ -106,7 +106,7 @@ impl AxService {
         let limit = if req.limit > 0 {
             req.limit
         } else {
-            rax_store::DEFAULT_TASK_LIST_LIMIT
+            rax_store::DEFAULT_PAGE_LIMIT
         };
         let offset = req.offset.max(0);
         let tasks = self
@@ -122,10 +122,13 @@ impl AxService {
             .task
             .ok_or_else(|| Status::invalid_argument("task required"))?;
         rax_api::validate_task(&task).map_err(|e| Status::invalid_argument(e.to_string()))?;
-        // Tasks are immutable, so a task saved now would keep a gateway binding
-        // that nothing applies. Accept it once gateway rules are enforced.
-        if task.spec.as_ref().is_some_and(|s| s.gateway.is_some()) {
-            return Err(Status::unimplemented("spec.gateway is not supported yet"));
+        // Tasks are immutable, so reject fields nothing honors yet (running
+        // from an existing ActorTemplate needs pull-based runner assignment,
+        // and retries need runner exit events) rather than store them.
+        if let Some(field) = first_unimplemented_task_field(task.spec.as_ref()) {
+            return Err(Status::unimplemented(format!(
+                "{field} is not supported yet"
+            )));
         }
         let meta = task.metadata.get_or_insert_with(Default::default);
         if meta.atespace.is_empty() {
@@ -147,15 +150,22 @@ impl AxService {
         atespace: &str,
         name: &str,
     ) -> Result<Task, Status> {
-        match self.tasks.get(atespace, name).await {
+        // Only an unfinished first create (stored as Queued with no template
+        // yet) may be applied again, and only unchanged. The stored record is
+        // checked, not the actor's state: a resuming actor also reads as
+        // Queued.
+        match self.tasks.get_stored(atespace, name).await {
             Ok(existing) => {
-                // Only a task that never got an actor may be applied again,
-                // and only unchanged. Its stored status is kept.
-                let pending = existing
-                    .status
+                let st = existing.status.clone().unwrap_or_default();
+                let deleting = existing
+                    .metadata
                     .as_ref()
-                    .is_some_and(|s| s.phase == phase::PENDING);
-                if !pending || existing.spec != task.spec {
+                    .is_some_and(|m| m.delete_time.is_some());
+                if st.state() != TaskState::Queued
+                    || !st.ate_actor_template.is_empty()
+                    || deleting
+                    || !task_spec_matches_existing(&existing, task.spec.as_ref())
+                {
                     return Err(Status::failed_precondition(format!(
                         "task {atespace}/{name} already exists and is immutable"
                     )));
@@ -168,10 +178,10 @@ impl AxService {
 
         // Tasks are immutable, so a task created before its Workspace would
         // keep an empty workspace for its whole life. Reject it instead.
-        let workspace = match task
-            .spec
+        let spec = task.spec.clone().unwrap_or_default();
+        let workspace = match spec
+            .workspace
             .as_ref()
-            .and_then(|s| s.workspace.as_ref())
             .map(|w| w.name.as_str())
             .filter(|n| !n.is_empty())
         {
@@ -190,43 +200,122 @@ impl AxService {
                 }
             },
         };
+        // A task gets its Gateway's rules when it is created, so the Gateway
+        // must already exist.
+        let gateway = match spec
+            .gateway
+            .as_ref()
+            .map(|g| g.name.as_str())
+            .filter(|n| !n.is_empty())
+        {
+            None => None,
+            Some(gw_name) => match self.resources.get_gateway(atespace, gw_name).await {
+                Ok(gw) => Some(gw),
+                Err(StoreError::NotFound) => {
+                    return Err(Status::failed_precondition(format!(
+                        "gateway {gw_name:?} not found in atespace {atespace:?}"
+                    )));
+                }
+                Err(e) => {
+                    return Err(Status::internal(format!(
+                        "getting gateway {gw_name:?}: {e}"
+                    )));
+                }
+            },
+        };
+        let effective = crate::profile::effective_profile(
+            workspace
+                .as_ref()
+                .and_then(|w| w.spec.as_ref())
+                .and_then(|s| s.profile.as_ref()),
+            spec.profile.as_ref(),
+        );
+        if !effective.ate_actor_template.is_empty() {
+            return Err(Status::unimplemented(
+                "spec.profile.ateActorTemplate is not supported yet",
+            ));
+        }
 
+        let stamp = now();
         let meta = task.metadata.as_mut().expect("metadata was defaulted");
         if meta.create_time.is_none() {
-            meta.create_time = Some(now());
+            meta.create_time = Some(stamp);
         }
-        // The task is Pending until its actor exists.
-        task.status.get_or_insert_with(Default::default).phase = phase::PENDING.into();
+        if meta.uid.is_empty() {
+            meta.uid = new_uid();
+        }
+        meta.update_time = Some(stamp);
+        let uid = meta.uid.clone();
+        let spec = task.spec.get_or_insert_with(TaskSpec::default);
+        if spec.session_id.is_empty() {
+            spec.session_id = uid;
+        }
+        let commands = spec.commands.clone();
+        let st = task.status.get_or_insert_with(TaskStatus::default);
+        if st.attempt == 0 {
+            st.attempt = 1;
+        }
+        st.generation += 1;
+        if !commands.is_empty() {
+            st.resolved_argv = commands;
+        }
+        // The task is Queued until its actor exists.
+        st.set_state(TaskState::Queued);
         self.tasks
             .save(&task)
             .await
             .map_err(internal("saving task"))?;
 
         // New tasks start suspended.
-        match &self.reconciler {
-            Some(r) => {
-                if let Err(e) = r.suspend(&mut task, workspace).await {
-                    return Err(self.record_failure(&mut task, "provisioning", &e).await);
-                }
-                // The actor exists, so reads take the task's phase from it
-                // from now on.
-                task.status.as_mut().unwrap().phase.clear();
-            }
-            None => task.status.as_mut().unwrap().phase = phase::SUSPENDED.into(),
+        if let Some(r) = &self.reconciler
+            && let Err(e) = r.suspend(&mut task, workspace, gateway).await
+        {
+            return Err(self.record_failure(&mut task, "provisioning", &e).await);
         }
-        self.tasks
-            .update(atespace, name, task.status.as_ref())
-            .await
-            .map_err(internal("updating task status"))?;
+        self.clear_stored_state(&mut task).await?;
+        if self.reconciler.is_none() {
+            task.status
+                .get_or_insert_with(Default::default)
+                .set_state(TaskState::Suspended);
+        }
 
         // Report the actor as it is now, as GetTask would.
         self.tasks.apply_actor(&mut task).await;
         Ok(task)
     }
 
+    /// Hands a task's state back to its actor after a create, suspend or
+    /// resume succeeds: it clears a deleteTime left by an earlier failed
+    /// delete (which cancels that deletion) and the stored state and status
+    /// detail, so reads take them from the actor, and stores the status with
+    /// a new generation.
+    async fn clear_stored_state(&self, task: &mut Task) -> Result<(), Status> {
+        let meta = task.metadata.get_or_insert_with(Default::default);
+        if meta.atespace.is_empty() {
+            meta.atespace = DEFAULT_ATESPACE.into();
+        }
+        let (atespace, name) = (meta.atespace.clone(), meta.name.clone());
+        if meta.delete_time.is_some() {
+            self.tasks
+                .set_delete_time(&atespace, &name, None)
+                .await
+                .map_err(internal("clearing task delete_time"))?;
+            meta.delete_time = None;
+        }
+        let st = task.status.get_or_insert_with(TaskStatus::default);
+        st.set_state(TaskState::Unspecified);
+        st.status_detail = None;
+        st.generation += 1;
+        self.tasks
+            .update(&atespace, &name, task.status.as_ref())
+            .await
+            .map_err(internal("updating task status"))
+    }
+
     /// Stores the status of a task that could not be provisioned or resumed:
-    /// phase Pending if `err` is a transient Substrate error, which a retry
-    /// may fix, and Failed otherwise. Returns the error for `action`.
+    /// state Queued if `err` is a transient Substrate error, which a retry
+    /// may fix, and Failed with the reason otherwise. Returns the error for
+    /// `action`.
     async fn record_failure(&self, task: &mut Task, action: &str, err: &Status) -> Status {
         let meta = task.metadata.clone().unwrap_or_default();
         tracing::error!(
@@ -235,12 +324,17 @@ impl AxService {
             "{action} task on substrate failed"
         );
         let st = task.status.get_or_insert_with(TaskStatus::default);
-        st.phase = if is_transient(err) {
-            phase::PENDING
+        if is_transient(err) {
+            st.set_state(TaskState::Queued);
+            st.status_detail = None;
         } else {
-            phase::FAILED
+            st.set_state(TaskState::Failed);
+            st.status_detail = Some(StatusDetail {
+                reason: TaskStatusReason::ProvisioningFailed.into(),
+                detail: err.message().to_owned(),
+            });
         }
-        .into();
+        st.generation += 1;
         if let Err(e) = self
             .tasks
             .update(&meta.atespace, &meta.name, task.status.as_ref())
@@ -263,15 +357,20 @@ impl AxService {
                 .get(&atespace, &name)
                 .await
                 .map_err(read_error("task", &name, &atespace))?;
-            // Mark the task as terminating while actor cleanup is in progress.
-            task.status.get_or_insert_with(Default::default).phase = phase::TERMINATING.into();
+            // Mark the task with a delete time while actor cleanup is in
+            // progress.
+            let stamp = now();
             self.tasks
-                .update(&atespace, &name, task.status.as_ref())
+                .set_delete_time(&atespace, &name, Some(stamp))
                 .await
-                .map_err(internal("updating task status"))?;
-            self.tasks
-                .delete(self.reconciler.as_deref(), &atespace, &name)
-                .await?;
+                .map_err(internal("updating task delete_time"))?;
+            let meta = task.metadata.get_or_insert_with(|| ObjectMeta {
+                atespace: atespace.clone(),
+                name: name.clone(),
+                ..Default::default()
+            });
+            meta.delete_time = Some(stamp);
+            self.tasks.delete(self.reconciler.as_deref(), &task).await?;
             Ok(api::DeleteTaskResponse {})
         })
         .await
@@ -286,31 +385,21 @@ impl AxService {
                 .get(&atespace, &name)
                 .await
                 .map_err(read_error("task", &name, &atespace))?;
-            match &self.reconciler {
-                Some(r) => {
-                    let ws = self.fetch_workspace(&atespace, &task).await;
-                    // Store nothing on failure: the actor keeps its state on
-                    // Substrate, and a stored Pending or Failed would hide it.
-                    r.suspend(&mut task, ws)
-                        .await
-                        .map_err(|e| substrate_error("suspending task on substrate", &e))?;
-                    // Clear any Pending or Failed left by an earlier failure,
-                    // so reads take the phase from the actor. This also clears
-                    // the Terminating left by a failed delete, which cancels
-                    // that deletion.
-                    task.status
-                        .get_or_insert_with(Default::default)
-                        .phase
-                        .clear();
-                }
-                None => {
-                    task.status.get_or_insert_with(Default::default).phase = phase::SUSPENDED.into()
-                }
+            if let Some(r) = &self.reconciler {
+                let ws = self.fetch_workspace(&atespace, &task).await;
+                let gw = self.fetch_gateway(&atespace, &task).await;
+                // Store nothing on failure: the actor keeps its state on
+                // Substrate, and a stored Queued or Failed would hide it.
+                r.suspend(&mut task, ws, gw)
+                    .await
+                    .map_err(|e| substrate_error("suspending task on substrate", &e))?;
             }
-            self.tasks
-                .update(&atespace, &name, task.status.as_ref())
-                .await
-                .map_err(internal("updating task status"))?;
+            self.clear_stored_state(&mut task).await?;
+            if self.reconciler.is_none() {
+                task.status
+                    .get_or_insert_with(Default::default)
+                    .set_state(TaskState::Suspended);
+            }
             self.tasks.apply_actor(&mut task).await;
             Ok(task)
         })
@@ -326,26 +415,19 @@ impl AxService {
                 .get(&atespace, &name)
                 .await
                 .map_err(read_error("task", &name, &atespace))?;
-            match &self.reconciler {
-                Some(r) => {
-                    let ws = self.fetch_workspace(&atespace, &task).await;
-                    if let Err(e) = r.resume(&mut task, ws).await {
-                        return Err(self.record_failure(&mut task, "resuming", &e).await);
-                    }
-                    // As in suspend_task: reads take the phase from the actor.
-                    task.status
-                        .get_or_insert_with(Default::default)
-                        .phase
-                        .clear();
-                }
-                None => {
-                    task.status.get_or_insert_with(Default::default).phase = phase::RUNNING.into()
+            if let Some(r) = &self.reconciler {
+                let ws = self.fetch_workspace(&atespace, &task).await;
+                let gw = self.fetch_gateway(&atespace, &task).await;
+                if let Err(e) = r.resume(&mut task, ws, gw).await {
+                    return Err(self.record_failure(&mut task, "resuming", &e).await);
                 }
             }
-            self.tasks
-                .update(&atespace, &name, task.status.as_ref())
-                .await
-                .map_err(internal("updating task status"))?;
+            self.clear_stored_state(&mut task).await?;
+            if self.reconciler.is_none() {
+                task.status
+                    .get_or_insert_with(Default::default)
+                    .set_state(TaskState::Working);
+            }
             self.tasks.apply_actor(&mut task).await;
             Ok(task)
         })
@@ -360,6 +442,16 @@ impl AxService {
             return None;
         }
         self.resources.get_workspace(atespace, name).await.ok()
+    }
+
+    /// Loads the Gateway the task binds, or `None` when it binds none or the
+    /// Gateway cannot be loaded.
+    async fn fetch_gateway(&self, atespace: &str, task: &Task) -> Option<Gateway> {
+        let name = task.spec.as_ref()?.gateway.as_ref()?.name.as_str();
+        if name.is_empty() {
+            return None;
+        }
+        self.resources.get_gateway(atespace, name).await.ok()
     }
 
     // --- Workspaces ---
@@ -378,31 +470,51 @@ impl AxService {
     ) -> Result<api::ListWorkspacesResponse, Status> {
         let workspaces = self
             .resources
-            .list_workspaces(&req.atespace)
+            .list_workspaces(&req.atespace, req.limit, req.offset.max(0))
             .await
             .map_err(internal("listing workspaces"))?;
         Ok(api::ListWorkspacesResponse { workspaces })
     }
 
-    pub async fn update_workspace(
+    /// Creates a workspace. Workspaces are immutable: creating one again is
+    /// fine only with the same spec, and returns the stored one.
+    pub async fn create_workspace(
         &self,
-        req: api::UpdateWorkspaceRequest,
+        req: api::CreateWorkspaceRequest,
     ) -> Result<Workspace, Status> {
         let mut ws = req
             .workspace
             .ok_or_else(|| Status::invalid_argument("workspace required"))?;
         rax_api::validate_workspace(&ws).map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let res = self.resources.clone();
-        let meta = default_metadata(ws.metadata.take(), |a, n| async move {
-            res.get_workspace(&a, &n)
-                .await
-                .ok()
-                .and_then(|w| w.metadata)
-        })
-        .await;
+        // A workspace saved now would keep a profile or gateway binding that
+        // nothing enforces yet.
+        if let Some(field) = first_unimplemented_workspace_field(ws.spec.as_ref()) {
+            return Err(Status::unimplemented(format!(
+                "{field} is not supported yet"
+            )));
+        }
+        ws.status = None;
+        let meta = default_metadata(ws.metadata.take(), |_, _| async { None }).await;
         let (atespace, name) = (meta.atespace.clone(), meta.name.clone());
         ws.metadata = Some(meta);
         self.locked("workspace", &atespace, &name, async {
+            match self.resources.get_workspace(&atespace, &name).await {
+                Ok(existing) => {
+                    let spec = |w: &Workspace| w.spec.clone().unwrap_or_default();
+                    if spec(&existing) != spec(&ws) {
+                        return Err(Status::failed_precondition(format!(
+                            "workspace {atespace}/{name} already exists and is immutable"
+                        )));
+                    }
+                    return Ok(existing);
+                }
+                Err(StoreError::NotFound) => {}
+                Err(e) => {
+                    return Err(Status::internal(format!(
+                        "checking existing workspace: {e}"
+                    )));
+                }
+            }
             self.resources
                 .save_workspace(&mut ws)
                 .await
@@ -571,6 +683,63 @@ impl AxService {
     }
 }
 
+/// A random (version 4) UUID, as metadata.uid holds.
+fn new_uid() -> String {
+    let mut b: [u8; 16] = rand::random();
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h = hex::encode(b);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    )
+}
+
+/// The first task field that is accepted but not honored yet, if the spec
+/// sets one.
+fn first_unimplemented_task_field(spec: Option<&TaskSpec>) -> Option<&'static str> {
+    let spec = spec?;
+    if spec
+        .profile
+        .as_ref()
+        .is_some_and(|p| !p.ate_actor_template.is_empty())
+    {
+        return Some("spec.profile.ateActorTemplate");
+    }
+    if spec.retry.is_some() {
+        return Some("spec.retry");
+    }
+    None
+}
+
+/// The first workspace field that is accepted but not honored yet: profiles
+/// wait for snapshot pre-warming, and a setup gateway for a setup actor.
+fn first_unimplemented_workspace_field(spec: Option<&WorkspaceSpec>) -> Option<&'static str> {
+    let spec = spec?;
+    if spec.profile.is_some() {
+        return Some("spec.profile");
+    }
+    if spec.setup.as_ref().is_some_and(|s| s.gateway.is_some()) {
+        return Some("spec.setup.gateway");
+    }
+    None
+}
+
+/// Compares a spec applied again with an existing Queued task's, allowing
+/// for sessionId having defaulted to metadata.uid on the first create.
+fn task_spec_matches_existing(existing: &Task, incoming: Option<&TaskSpec>) -> bool {
+    let mut want = incoming.cloned().unwrap_or_default();
+    let uid = existing.metadata.as_ref().map_or("", |m| m.uid.as_str());
+    if want.session_id.is_empty() && !uid.is_empty() {
+        want.session_id = uid.to_owned();
+    }
+    existing.spec.clone().unwrap_or_default() == want
+}
+
 /// Maps a Substrate error to the status the caller sees: Unavailable when it
 /// is worth retrying, Internal otherwise.
 fn substrate_error(context: &str, e: &Status) -> Status {
@@ -600,123 +769,190 @@ where
     meta
 }
 
+/// Serves one AX RPC in a server span, measuring it, as AX's otelgrpc stats
+/// handler does for the methods it registers.
+async fn rpc<Req, T>(
+    method: &str,
+    req: &Request<Req>,
+    handler: impl Future<Output = Result<T, Status>>,
+) -> Result<T, Status> {
+    rax_otelenv::rpc::server_call(&format!("ax.v1alpha1.AX/{method}"), req.metadata(), handler)
+        .await
+}
+
 #[tonic::async_trait]
 impl Ax for AxService {
     async fn get_task(&self, r: Request<api::GetTaskRequest>) -> Result<Response<Task>, Status> {
-        self.get_task(r.into_inner()).await.map(Response::new)
+        rpc("GetTask", &r, self.get_task(r.get_ref().clone()))
+            .await
+            .map(Response::new)
     }
     async fn list_tasks(
         &self,
         r: Request<api::ListTasksRequest>,
     ) -> Result<Response<api::ListTasksResponse>, Status> {
-        self.list_tasks(r.into_inner()).await.map(Response::new)
+        rpc("ListTasks", &r, self.list_tasks(r.get_ref().clone()))
+            .await
+            .map(Response::new)
     }
     async fn create_task(
         &self,
         r: Request<api::CreateTaskRequest>,
     ) -> Result<Response<Task>, Status> {
-        self.create_task(r.into_inner()).await.map(Response::new)
+        rpc("CreateTask", &r, self.create_task(r.get_ref().clone()))
+            .await
+            .map(Response::new)
     }
     async fn delete_task(
         &self,
         r: Request<api::DeleteTaskRequest>,
     ) -> Result<Response<api::DeleteTaskResponse>, Status> {
-        self.delete_task(r.into_inner()).await.map(Response::new)
+        rpc("DeleteTask", &r, self.delete_task(r.get_ref().clone()))
+            .await
+            .map(Response::new)
     }
     async fn suspend_task(
         &self,
         r: Request<api::SuspendTaskRequest>,
     ) -> Result<Response<Task>, Status> {
-        self.suspend_task(r.into_inner()).await.map(Response::new)
+        rpc("SuspendTask", &r, self.suspend_task(r.get_ref().clone()))
+            .await
+            .map(Response::new)
     }
     async fn resume_task(
         &self,
         r: Request<api::ResumeTaskRequest>,
     ) -> Result<Response<Task>, Status> {
-        self.resume_task(r.into_inner()).await.map(Response::new)
+        rpc("ResumeTask", &r, self.resume_task(r.get_ref().clone()))
+            .await
+            .map(Response::new)
     }
     async fn get_workspace(
         &self,
         r: Request<api::GetWorkspaceRequest>,
     ) -> Result<Response<Workspace>, Status> {
-        self.get_workspace(r.into_inner()).await.map(Response::new)
+        rpc("GetWorkspace", &r, self.get_workspace(r.get_ref().clone()))
+            .await
+            .map(Response::new)
     }
     async fn list_workspaces(
         &self,
         r: Request<api::ListWorkspacesRequest>,
     ) -> Result<Response<api::ListWorkspacesResponse>, Status> {
-        self.list_workspaces(r.into_inner())
-            .await
-            .map(Response::new)
+        rpc(
+            "ListWorkspaces",
+            &r,
+            self.list_workspaces(r.get_ref().clone()),
+        )
+        .await
+        .map(Response::new)
     }
-    async fn update_workspace(
+    async fn create_workspace(
         &self,
-        r: Request<api::UpdateWorkspaceRequest>,
+        r: Request<api::CreateWorkspaceRequest>,
     ) -> Result<Response<Workspace>, Status> {
-        self.update_workspace(r.into_inner())
-            .await
-            .map(Response::new)
+        rpc(
+            "CreateWorkspace",
+            &r,
+            self.create_workspace(r.get_ref().clone()),
+        )
+        .await
+        .map(Response::new)
     }
     async fn delete_workspace(
         &self,
         r: Request<api::DeleteWorkspaceRequest>,
     ) -> Result<Response<api::DeleteWorkspaceResponse>, Status> {
-        self.delete_workspace(r.into_inner())
-            .await
-            .map(Response::new)
+        rpc(
+            "DeleteWorkspace",
+            &r,
+            self.delete_workspace(r.get_ref().clone()),
+        )
+        .await
+        .map(Response::new)
     }
     async fn get_gateway(
         &self,
         r: Request<api::GetGatewayRequest>,
     ) -> Result<Response<Gateway>, Status> {
-        self.get_gateway(r.into_inner()).await.map(Response::new)
+        rpc("GetGateway", &r, self.get_gateway(r.get_ref().clone()))
+            .await
+            .map(Response::new)
     }
     async fn list_gateways(
         &self,
         r: Request<api::ListGatewaysRequest>,
     ) -> Result<Response<api::ListGatewaysResponse>, Status> {
-        self.list_gateways(r.into_inner()).await.map(Response::new)
+        rpc("ListGateways", &r, self.list_gateways(r.get_ref().clone()))
+            .await
+            .map(Response::new)
     }
     async fn create_gateway(
         &self,
         r: Request<api::CreateGatewayRequest>,
     ) -> Result<Response<Gateway>, Status> {
-        self.create_gateway(r.into_inner()).await.map(Response::new)
+        rpc(
+            "CreateGateway",
+            &r,
+            self.create_gateway(r.get_ref().clone()),
+        )
+        .await
+        .map(Response::new)
     }
     async fn update_gateway(
         &self,
         r: Request<api::UpdateGatewayRequest>,
     ) -> Result<Response<Gateway>, Status> {
-        self.update_gateway(r.into_inner()).await.map(Response::new)
+        rpc(
+            "UpdateGateway",
+            &r,
+            self.update_gateway(r.get_ref().clone()),
+        )
+        .await
+        .map(Response::new)
     }
     async fn delete_gateway(
         &self,
         r: Request<api::DeleteGatewayRequest>,
     ) -> Result<Response<api::DeleteGatewayResponse>, Status> {
-        self.delete_gateway(r.into_inner()).await.map(Response::new)
+        rpc(
+            "DeleteGateway",
+            &r,
+            self.delete_gateway(r.get_ref().clone()),
+        )
+        .await
+        .map(Response::new)
     }
     async fn get_model(
         &self,
         r: Request<api::GetModelRequest>,
     ) -> Result<Response<api::Model>, Status> {
-        self.get_model(r.into_inner()).await.map(Response::new)
+        rpc("GetModel", &r, self.get_model(r.get_ref().clone()))
+            .await
+            .map(Response::new)
     }
     async fn list_models(
         &self,
         r: Request<api::ListModelsRequest>,
     ) -> Result<Response<api::ListModelsResponse>, Status> {
-        self.list_models(r.into_inner()).await.map(Response::new)
+        rpc("ListModels", &r, self.list_models(r.get_ref().clone()))
+            .await
+            .map(Response::new)
     }
     async fn update_model(
         &self,
         r: Request<api::UpdateModelRequest>,
     ) -> Result<Response<api::Model>, Status> {
-        self.update_model(r.into_inner()).await.map(Response::new)
+        rpc("UpdateModel", &r, self.update_model(r.get_ref().clone()))
+            .await
+            .map(Response::new)
     }
     async fn delete_model(
         &self,
         r: Request<api::DeleteModelRequest>,
     ) -> Result<Response<api::DeleteModelResponse>, Status> {
-        self.delete_model(r.into_inner()).await.map(Response::new)
+        rpc("DeleteModel", &r, self.delete_model(r.get_ref().clone()))
+            .await
+            .map(Response::new)
     }
 }

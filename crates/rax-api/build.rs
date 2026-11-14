@@ -9,6 +9,10 @@
 //! Only its messages are generated, into `rax_api::substrate::ateapi::v1`: the
 //! Control service client lives in rax-substrate.
 //!
+//! task.proto imports googleapis' `google/rpc/status.proto`, which AX takes
+//! from buf.build/googleapis/googleapis; it is copied to proto/google/rpc and
+//! generated into `rax_api::google::rpc`.
+//!
 //! protox compiles the proto in pure Rust, so no protoc is needed. prost and
 //! tonic generate the messages and service; pbjson generates serde impls that
 //! follow the protobuf JSON mapping (lowerCamelCase names, json_name, omitted
@@ -18,6 +22,8 @@ use std::{env, path::PathBuf};
 
 const SUBSTRATE_PACKAGE: &str = ".substrate.ateapi.v1";
 const SUBSTRATE_RUST: &str = "crate::substrate::ateapi::v1";
+const RPC_PACKAGE: &str = ".google.rpc";
+const RPC_RUST: &str = "crate::google::rpc";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../proto");
@@ -37,7 +43,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(&descriptor_path, prost::Message::encode_to_vec(&fds))?;
 
     // Substrate's messages, without its service: prost alone generates no
-    // services, and AX's own package is generated below.
+    // services, and AX's own package is generated below. google.rpc.Status,
+    // which task.proto imports, is generated here too.
     // It goes to its own directory: tonic writes a services-only file for the
     // package below.
     let substrate_out = out.join("substrate");
@@ -55,17 +62,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     config
         .compile_well_known_types()
         .extern_path(".google.protobuf", "::pbjson_types")
-        .extern_path(SUBSTRATE_PACKAGE, SUBSTRATE_RUST);
+        .extern_path(SUBSTRATE_PACKAGE, SUBSTRATE_RUST)
+        .extern_path(RPC_PACKAGE, RPC_RUST);
     tonic_prost_build::configure().compile_fds_with_config(fds, config)?;
 
     let descriptors = std::fs::read(&descriptor_path)?;
     pbjson_build::Builder::new()
         .register_descriptors(&descriptors)?
         .extern_path(SUBSTRATE_PACKAGE, SUBSTRATE_RUST)
+        .extern_path(RPC_PACKAGE, RPC_RUST)
         .build(&[".ax.v1alpha1"])?;
     pbjson_build::Builder::new()
         .register_descriptors(&descriptors)?
         .out_dir(&substrate_out)
-        .build(&[SUBSTRATE_PACKAGE])?;
+        .build(&[SUBSTRATE_PACKAGE, RPC_PACKAGE])?;
     Ok(())
 }

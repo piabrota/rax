@@ -1,8 +1,12 @@
 //! The OpenTelemetry environment rules rax-server and the `rax` CLI share,
 //! as AX keeps them in its `otelenv` package: how an `OTEL_*_EXPORTER`
-//! variable selects exporters, and the resource that describes the process.
-//! This crate depends only on the OpenTelemetry API and SDK, so the CLI does
-//! not link rax-server's metric and log exporters.
+//! variable selects exporters, and the resource that describes the process;
+//! and, in [`rpc`], the spans and histograms of gRPC calls, as AX's
+//! `telemetry` package records them with otelgrpc. This crate depends only
+//! on the OpenTelemetry API and SDK (and tonic), so the CLI does not link
+//! rax-server's metric and log exporters.
+
+pub mod rpc;
 
 use std::collections::BTreeSet;
 use std::fmt;
