@@ -3,6 +3,7 @@
 
 pub mod args;
 pub mod commands;
+pub mod describe;
 pub mod format;
 pub mod router_tls;
 pub mod trace;

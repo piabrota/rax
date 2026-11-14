@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use rand::RngCore;
 use rax_api::Manifest;
-use rax_api::v1alpha1::{Gateway, Model, Task, TaskStatus, Workspace};
+use rax_api::v1alpha1::{Gateway, Model, ObjectMeta, Task, TaskStatus, Workspace};
 use serde_json::Value;
 use tokio::sync::oneshot;
 use tokio_postgres::types::ToSql;
@@ -21,8 +21,8 @@ use tokio_postgres::{Config, NoTls};
 
 use crate::lock::{LockGuard, Locker, lock_key};
 use crate::{
-    DEFAULT_TASK_LIST_LIMIT, ResourceStore, Result, StoreError, TaskStore, all_atespaces,
-    default_atespace, meta_key, prepare_gateway, prepare_model, prepare_task, prepare_workspace,
+    ResourceStore, Result, StoreError, TaskStore, all_atespaces, default_atespace, meta_key,
+    page_limit, prepare_gateway, prepare_model, prepare_task, prepare_workspace,
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
@@ -342,6 +342,42 @@ impl PostgresStore {
     }
 }
 
+impl PostgresStore {
+    /// Changes one task record in place, under a row lock, without changing
+    /// its position in lists.
+    async fn modify_task(
+        &self,
+        atespace: &str,
+        name: &str,
+        context: &str,
+        f: impl FnOnce(&mut Task) + Send,
+    ) -> Result<()> {
+        let atespace = default_atespace(atespace);
+        let mut client = self.pool.get().await.map_err(pool_error)?;
+        let err = backend(context);
+        let tx = client.transaction().await.map_err(&err)?;
+        let row = tx
+            .query_opt(
+                "SELECT data FROM tasks WHERE atespace = $1 AND name = $2 FOR UPDATE",
+                &[&atespace, &name],
+            )
+            .await
+            .map_err(&err)?
+            .ok_or(StoreError::NotFound)?;
+        let mut task: Task = decode("tasks", row.get(0))?;
+        f(&mut task);
+        let data = rax_api::to_json(&task)
+            .map_err(|e| StoreError::Backend(format!("encoding task: {e}")))?;
+        tx.execute(
+            "UPDATE tasks SET data = $3 WHERE atespace = $1 AND name = $2",
+            &[&atespace, &name, &data],
+        )
+        .await
+        .map_err(&err)?;
+        tx.commit().await.map_err(&err)
+    }
+}
+
 fn decode<T: Manifest>(table: &str, data: Value) -> Result<T> {
     rax_api::from_json_lenient(data)
         .map_err(|e| StoreError::Backend(format!("decoding {table}: {e}")))
@@ -359,12 +395,8 @@ impl TaskStore for PostgresStore {
     }
 
     async fn list_tasks(&self, atespace: &str, limit: i64, offset: i64) -> Result<Vec<Task>> {
-        let limit = if limit <= 0 {
-            DEFAULT_TASK_LIST_LIMIT
-        } else {
-            limit
-        };
-        self.list("tasks", atespace, limit, offset).await
+        self.list("tasks", atespace, page_limit(limit), offset)
+            .await
     }
 
     async fn update_task_status(
@@ -373,29 +405,28 @@ impl TaskStore for PostgresStore {
         name: &str,
         status: TaskStatus,
     ) -> Result<()> {
-        let atespace = default_atespace(atespace);
-        let mut client = self.pool.get().await.map_err(pool_error)?;
-        let err = backend("updating task status");
-        let tx = client.transaction().await.map_err(&err)?;
-        let row = tx
-            .query_opt(
-                "SELECT data FROM tasks WHERE atespace = $1 AND name = $2 FOR UPDATE",
-                &[&atespace, &name],
-            )
-            .await
-            .map_err(&err)?
-            .ok_or(StoreError::NotFound)?;
-        let mut task: Task = decode("tasks", row.get(0))?;
-        task.status = Some(status);
-        let data = rax_api::to_json(&task)
-            .map_err(|e| StoreError::Backend(format!("encoding task: {e}")))?;
-        tx.execute(
-            "UPDATE tasks SET data = $3 WHERE atespace = $1 AND name = $2",
-            &[&atespace, &name, &data],
-        )
+        self.modify_task(atespace, name, "updating task status", |t| {
+            t.status = Some(status)
+        })
         .await
-        .map_err(&err)?;
-        tx.commit().await.map_err(&err)
+    }
+
+    async fn set_task_delete_time(
+        &self,
+        atespace: &str,
+        name: &str,
+        delete_time: Option<pbjson_types::Timestamp>,
+    ) -> Result<()> {
+        self.modify_task(atespace, name, "updating task delete time", |t| {
+            t.metadata
+                .get_or_insert_with(|| ObjectMeta {
+                    atespace: default_atespace(atespace).into(),
+                    name: name.into(),
+                    ..Default::default()
+                })
+                .delete_time = delete_time
+        })
+        .await
     }
 
     async fn delete_task(&self, atespace: &str, name: &str) -> Result<()> {
@@ -414,8 +445,14 @@ impl ResourceStore for PostgresStore {
         self.get("workspaces", atespace, name).await
     }
 
-    async fn list_workspaces(&self, atespace: &str) -> Result<Vec<Workspace>> {
-        self.list("workspaces", atespace, 0, 0).await
+    async fn list_workspaces(
+        &self,
+        atespace: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Workspace>> {
+        self.list("workspaces", atespace, page_limit(limit), offset)
+            .await
     }
 
     async fn delete_workspace(&self, atespace: &str, name: &str) -> Result<()> {
@@ -567,12 +604,12 @@ mod tests {
         };
         s.exec(
             r#"INSERT INTO tasks (atespace, name, data, saved_at) VALUES
-               ('default', 'newer', '{"metadata":{"name":"newer","atespace":"default"},"spec":{"image":"x","fromTheFuture":1}}', now()),
+               ('default', 'newer', '{"metadata":{"name":"newer","atespace":"default"},"spec":{"profile":{"image":"x"},"fromTheFuture":1}}', now()),
                ('default', 'broken', '{"metadata":"not an object"}', now())"#,
         )
         .await;
         let t = s.get_task("default", "newer").await.unwrap();
-        assert_eq!(t.spec.unwrap().image, "x");
+        assert_eq!(t.spec.unwrap().profile.unwrap().image, "x");
         // A record that no longer parses is skipped by lists.
         let list = s.list_tasks("default", 0, 0).await.unwrap();
         assert_eq!(list.len(), 1);

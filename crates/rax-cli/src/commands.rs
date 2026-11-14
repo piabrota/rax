@@ -1,14 +1,14 @@
 //! The commands.
 
 use std::io::Write;
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant, SystemTime};
 
 use rax_api::v1alpha1::{
     self as api, Gateway, Model, ObjectMeta, Task, Workspace, ax_client::AxClient,
 };
 use rax_api::{
-    KIND_GATEWAY, KIND_MODEL, KIND_TASK, KIND_WORKSPACE, Manifest, from_yaml, phase, to_yaml,
+    KIND_GATEWAY, KIND_MODEL, KIND_TASK, KIND_WORKSPACE, Manifest, format_task_state, from_yaml,
+    to_yaml,
 };
 use rax_guest::client::go_status;
 use rax_guest::proto::Signal;
@@ -20,7 +20,7 @@ use tonic::{Code, Status};
 
 use crate::Error;
 use crate::args::parse_ssh_args;
-use crate::format::{format_age, go_strings, go_value, sorted, table};
+use crate::format::{format_age, go_value, table};
 use crate::router_tls::{ROUTER_SERVER_NAME, router_tls_config};
 use crate::trace::{self, Traced};
 use crate::tunnel;
@@ -237,8 +237,8 @@ async fn apply_document(
                 .map(|r| r.into_inner().spec);
             let outcome = apply_outcome(existing, &ws.spec)?;
             let res = client
-                .update_workspace(req(
-                    api::UpdateWorkspaceRequest {
+                .create_workspace(req(
+                    api::CreateWorkspaceRequest {
                         workspace: Some(ws),
                     },
                     timeout,
@@ -323,7 +323,7 @@ fn yaml_type(v: &Yaml) -> &'static str {
     }
 }
 
-fn age_of(meta: &Option<ObjectMeta>) -> String {
+pub(crate) fn age_of(meta: &Option<ObjectMeta>) -> String {
     meta.as_ref()
         .and_then(|m| m.create_time.as_ref())
         .and_then(|t| {
@@ -363,37 +363,8 @@ pub async fn run_get(server: &str, atespace: &str, args: &[String]) -> Result<()
                 .map_err(status_err("listing tasks"))?
                 .into_inner()
                 .tasks;
-            let mut rows = vec![cells(&[
-                "NAME",
-                "ATESPACE",
-                "PHASE",
-                "ACTOR",
-                "WORKER-IP",
-                "AGE",
-            ])];
-            for task in &tasks {
-                let s = task.status.clone().unwrap_or_default();
-                let or_none = |v: &str| {
-                    if v.is_empty() {
-                        "<none>".to_owned()
-                    } else {
-                        v.to_owned()
-                    }
-                };
-                let (name, ns) = meta_of(&task.metadata);
-                rows.push(vec![
-                    name.into(),
-                    ns.into(),
-                    if s.phase.is_empty() {
-                        phase::PENDING.into()
-                    } else {
-                        s.phase.clone()
-                    },
-                    or_none(&s.actor),
-                    or_none(&s.worker_ip),
-                    age_of(&task.metadata),
-                ]);
-            }
+            let mut rows = vec![cells(&["NAME", "ATESPACE", "STATE", "ACTOR", "AGE"])];
+            rows.extend(tasks.iter().map(crate::describe::task_row));
             print!("{}", table(&rows, 3));
             Ok(())
         }
@@ -413,24 +384,19 @@ pub async fn run_get(server: &str, atespace: &str, args: &[String]) -> Result<()
         }
         ("workspaces" | "workspace", None) => {
             let list = client
-                .list_workspaces(req(api::ListWorkspacesRequest { atespace: ns }, t))
+                .list_workspaces(req(
+                    api::ListWorkspacesRequest {
+                        atespace: ns,
+                        ..Default::default()
+                    },
+                    t,
+                ))
                 .await
                 .map_err(status_err("listing workspaces"))?
                 .into_inner()
                 .workspaces;
             let mut rows = vec![cells(&["NAME", "ATESPACE", "GIT-REPOS", "MCP-SERVERS"])];
-            for ws in &list {
-                let (git, mcp) = ws.spec.as_ref().map_or((0, 0), |s| {
-                    (s.git.len(), s.mcp.as_ref().map_or(0, |m| m.servers.len()))
-                });
-                let (name, ns) = meta_of(&ws.metadata);
-                rows.push(vec![
-                    name.into(),
-                    ns.into(),
-                    git.to_string(),
-                    mcp.to_string(),
-                ]);
-            }
+            rows.extend(list.iter().map(crate::describe::workspace_row));
             print!("{}", table(&rows, 3));
             Ok(())
         }
@@ -519,7 +485,9 @@ fn cells(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()
 }
 
-fn struct_json(s: &Option<pbjson_types::Struct>) -> serde_json::Map<String, serde_json::Value> {
+pub(crate) fn struct_json(
+    s: &Option<pbjson_types::Struct>,
+) -> serde_json::Map<String, serde_json::Value> {
     match s.as_ref().and_then(|s| serde_json::to_value(s).ok()) {
         Some(serde_json::Value::Object(map)) => map,
         _ => serde_json::Map::new(),
@@ -620,51 +588,7 @@ pub async fn run_describe(server: &str, atespace: &str, args: &[String]) -> Resu
             .await
             .map_err(status_err(&format!("getting workspace {name:?}")))?
             .into_inner();
-        let (n, a) = meta_of(&ws.metadata);
-        println!("Name:         {n}");
-        println!("Atespace:     {a}");
-        if let Some(spec) = &ws.spec {
-            if !spec.git.is_empty() {
-                println!("Git Repositories:");
-                for g in &spec.git {
-                    let branch = if g.branch.is_empty() {
-                        "main"
-                    } else {
-                        &g.branch
-                    };
-                    println!("  - {} ({}, branch: {branch})", g.name, g.repo);
-                }
-            }
-            if let Some(mcp) = &spec.mcp {
-                if !mcp.registries.is_empty() {
-                    println!("MCP Registries:");
-                    for r in &mcp.registries {
-                        println!("  - Provider: {}, Query: {:?}", r.provider, r.query);
-                    }
-                }
-                if !mcp.servers.is_empty() {
-                    println!("MCP Servers:");
-                    for s in &mcp.servers {
-                        if !s.endpoint.is_empty() {
-                            println!("  - {}: {}", s.name, s.endpoint);
-                        } else {
-                            println!("  - {}: {} {}", s.name, s.command, go_strings(&s.args));
-                        }
-                    }
-                }
-            }
-            if let Some(skills) = &spec.skills {
-                if !skills.registries.is_empty() {
-                    println!("Skill Registries:");
-                    for r in &skills.registries {
-                        println!("  - Provider: {}, Query: {:?}", r.provider, r.query);
-                    }
-                }
-                if !skills.path.is_empty() {
-                    println!("Skills Path:      {}", skills.path);
-                }
-            }
-        }
+        print!("{}", crate::describe::describe_workspace(&ws));
         return Ok(());
     }
 
@@ -679,46 +603,7 @@ pub async fn run_describe(server: &str, atespace: &str, args: &[String]) -> Resu
         .await
         .map_err(status_err(&format!("getting task {name:?}")))?
         .into_inner();
-    let (n, a) = meta_of(&task.metadata);
-    let status = task.status.clone().unwrap_or_default();
-    println!("Name:         {n}");
-    println!("Atespace:     {a}");
-    println!("Phase:        {}", status.phase);
-    println!("Actor:        {}", status.actor);
-    println!("Worker IP:    {}", status.worker_ip);
-    if let Some(spec) = &task.spec {
-        if let Some(r) = &spec.workspace {
-            println!("Workspace:    {}  path={}", r.name, spec.workspace_path());
-        }
-        if !spec.image.is_empty() {
-            println!("Image:        {}", spec.image);
-        }
-        if !spec.command.is_empty() {
-            println!("Command:      {}", go_strings(&spec.command));
-        }
-        let config = struct_json(&spec.config);
-        if !config.is_empty()
-            && let Ok(out) = serde_yaml_ng::to_string(&sorted(&serde_json::Value::Object(config)))
-        {
-            println!("Config:");
-            for line in out.trim_end_matches('\n').lines() {
-                println!("  {line}");
-            }
-        }
-    }
-    if !status.conditions.is_empty() {
-        println!("\nConditions:");
-        let mut rows = vec![cells(&["  TYPE", "STATUS", "REASON", "MESSAGE"])];
-        for c in &status.conditions {
-            rows.push(vec![
-                format!("  {}", c.r#type),
-                c.status.clone(),
-                c.reason.clone(),
-                c.message.clone(),
-            ]);
-        }
-        print!("{}", table(&rows, 2));
-    }
+    print!("{}", crate::describe::describe_task(&task));
     Ok(())
 }
 
@@ -928,29 +813,6 @@ pub fn run_tunnel(args: &[String]) -> Result<(), Error> {
     }
 }
 
-/// Splits a worker IP into host and port; the runner's guest port is 80
-/// unless the IP carries one.
-pub fn guest_endpoint(worker_ip: &str) -> (String, u16) {
-    if let Ok(addr) = worker_ip.parse::<SocketAddr>() {
-        return (addr.ip().to_string(), addr.port());
-    }
-    match worker_ip.rsplit_once(':') {
-        Some((host, port)) if !host.contains(':') => match port.parse() {
-            Ok(p) => (host.to_owned(), p),
-            Err(_) => (host.to_owned(), 80),
-        },
-        _ => (worker_ip.trim_matches(['[', ']']).to_owned(), 80),
-    }
-}
-
-fn join_host_port(host: &str, port: u16) -> String {
-    if host.contains(':') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    }
-}
-
 /// Relays each interrupt to the returned channel, except that one arriving
 /// within `window` of the previous one calls `exit` instead, so a single
 /// Ctrl-C reaches the remote command and a repeated one still escapes.
@@ -975,27 +837,25 @@ pub fn escalate_interrupts(
     rx
 }
 
-/// Connects to a task's guest services: directly when the worker is
-/// reachable, else through Substrate's atenet router (mTLS on 443, falling
-/// back to plaintext on 80). Returns the port-forward the connection runs
-/// over, if any.
+/// Connects to a task's guest services: directly through the atenet router
+/// at `ATENET_ROUTER_ADDR` when that is set (in-cluster), else through a
+/// port-forward to Substrate's atenet router (mTLS on 443, falling back to
+/// plaintext on 80). Returns the port-forward the connection runs over, if
+/// any.
 fn dial_guest(
-    host: &str,
-    port: u16,
     target_actor: &str,
     kube_context: &str,
     ax_namespace: &str,
 ) -> Result<(GuestClient, Option<tunnel::PortForward>), Error> {
-    // 1. The worker directly, when it is reachable (in-cluster or a mesh).
-    let endpoint = join_host_port(host, port);
-    let direct = endpoint
-        .to_socket_addrs()
+    // 1. The router directly, when its address is known.
+    if let Some(router) = std::env::var("ATENET_ROUTER_ADDR")
         .ok()
-        .and_then(|mut a| a.next())
-        .is_some_and(|a| TcpStream::connect_timeout(&a, Duration::from_millis(500)).is_ok());
-    if direct {
-        let c = GuestClient::connect(&endpoint, None, None)
-            .map_err(|e| format!("connecting to guest at {endpoint}: {e}"))?;
+        .filter(|a| !a.is_empty())
+    {
+        let addr = router.strip_prefix("http://").unwrap_or(&router);
+        let addr = addr.strip_prefix("https://").unwrap_or(addr);
+        let c = GuestClient::connect(addr, Some(target_actor), None)
+            .map_err(|e| format!("connecting to guest via atenet-router at {addr}: {e}"))?;
         return Ok((c, None));
     }
 
@@ -1075,10 +935,10 @@ pub async fn run_ssh(
     let Some(status) = &task.status else {
         return Err(format!("task {task_name:?} has no status available"));
     };
-    if status.phase != phase::RUNNING {
+    if status.state() != api::TaskState::Working {
         return Err(format!(
-            "task {task_name:?} is in phase {:?} (must be Running to ssh)",
-            status.phase
+            "task {task_name:?} is in state {:?} (must be Working to ssh)",
+            format_task_state(&task)
         ));
     }
     if !task.spec.as_ref().is_some_and(|s| s.debug) {
@@ -1086,14 +946,13 @@ pub async fn run_ssh(
             "task {task_name:?} does not expose guest services; set spec.debug: true and re-apply to enable rax ssh"
         ));
     }
-    if status.worker_ip.is_empty() {
-        return Err(format!("task {task_name:?} has no worker IP assigned"));
+    if status.actor.is_empty() {
+        return Err(format!("task {task_name:?} has no actor assigned"));
     }
 
-    let (host, port) = guest_endpoint(&status.worker_ip);
     let target_actor = format!("{}/{}", meta_of(&task.metadata).1, status.actor);
     // The port-forward, if any, is kept alive for the session.
-    let (guest, _forward) = dial_guest(&host, port, &target_actor, kube_context, ax_namespace)?;
+    let (guest, _forward) = dial_guest(&target_actor, kube_context, ax_namespace)?;
 
     // A bare shell on a terminal runs interactively, so it prompts and Ctrl-C
     // stops what it runs rather than the shell.
@@ -1176,15 +1035,6 @@ mod tests {
         assert_eq!(normalize_kind("models").unwrap(), KIND_MODEL);
         assert_eq!(normalize_kind("s").unwrap_err(), "missing kind");
         assert!(normalize_kind("pod").is_err());
-    }
-
-    #[test]
-    fn guest_endpoints() {
-        assert_eq!(guest_endpoint("10.0.0.5"), ("10.0.0.5".into(), 80));
-        assert_eq!(guest_endpoint("10.0.0.5:8080"), ("10.0.0.5".into(), 8080));
-        assert_eq!(guest_endpoint("[fd00::1]:81"), ("fd00::1".into(), 81));
-        assert_eq!(guest_endpoint("fd00::1"), ("fd00::1".into(), 80));
-        assert_eq!(join_host_port("fd00::1", 80), "[fd00::1]:80");
     }
 
     #[tokio::test]

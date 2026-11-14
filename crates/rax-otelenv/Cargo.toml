@@ -7,6 +7,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-opentelemetry = { workspace = true, features = ["trace"] }
+opentelemetry = { workspace = true, features = ["trace", "metrics"] }
 opentelemetry_sdk = { workspace = true, features = ["trace"] }
 opentelemetry-semantic-conventions.workspace = true
+tonic.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

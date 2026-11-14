@@ -290,3 +290,128 @@ async fn sends_the_token_from_the_token_file() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn ensure_template_returns_lookup_errors_other_than_not_found() {
+    let fake = FakeSubstrate::new();
+    let client = fake.start().await;
+    fake.state()
+        .fail("GetActorTemplate", [Status::permission_denied("no")]);
+    let err = client
+        .ensure_actor_template("default", "t", "", None, &BTreeMap::new())
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied);
+    assert!(fake.state().created_templates.is_empty());
+}
+
+#[tokio::test]
+async fn egress_policy_is_created_once() {
+    use rax_substrate::ateapi::{EgressRule, HttpsRule};
+    let fake = FakeSubstrate::new();
+    let client = fake.start().await;
+    fake.state()
+        .put_actor("default", "a", ActorState::Suspended);
+    let err = client
+        .get_actor_egress_policy("default", "a")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::NotFound);
+    let rules = [EgressRule {
+        https: Some(HttpsRule {
+            hostnames: vec!["api.example.com".into()],
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+    client
+        .ensure_actor_egress_policy("default", "a", &rules)
+        .await
+        .unwrap();
+    // A second create finds the policy and keeps it.
+    client
+        .ensure_actor_egress_policy("default", "a", &[])
+        .await
+        .unwrap();
+    let policy = client
+        .get_actor_egress_policy("default", "a")
+        .await
+        .unwrap();
+    assert_eq!(policy.rules, rules);
+    assert_eq!(policy.metadata.unwrap().name, "default");
+
+    fake.state().fail(
+        "CreateActorEgressPolicy",
+        [Status::invalid_argument("bad rule")],
+    );
+    fake.state()
+        .put_actor("default", "b", ActorState::Suspended);
+    let err = client
+        .ensure_actor_egress_policy("default", "b", &rules)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn tags_seed_actors() {
+    let fake = FakeSubstrate::new();
+    let client = fake.start().await;
+    client.ensure_atespace("default").await.unwrap();
+    client
+        .ensure_actor_template("default", "tmpl", "img", None, &BTreeMap::new())
+        .await
+        .unwrap();
+    client
+        .ensure_actor("default", "setup", "default", "tmpl")
+        .await
+        .unwrap();
+    let tag = client
+        .create_tag("default", "ws-tag", "setup")
+        .await
+        .unwrap();
+    assert_eq!(tag.status.unwrap().actor_template_uid, "uid-default/tmpl");
+    assert_eq!(client.get_tag("default", "ws-tag").await.unwrap().scope, 1);
+    assert_eq!(client.list_tags("default").await.unwrap().len(), 1);
+    assert!(client.list_tags("other").await.unwrap().is_empty());
+
+    let actor = client
+        .ensure_actor_from_tag("default", "task", "default", "tmpl", "ws-tag")
+        .await
+        .unwrap();
+    assert_eq!(actor.source_tag.unwrap().name, "ws-tag");
+    let err = client
+        .ensure_actor_from_tag("default", "task2", "default", "tmpl", "missing")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::NotFound);
+
+    client.delete_tag("default", "ws-tag").await.unwrap();
+    client.delete_tag("default", "ws-tag").await.unwrap();
+    assert_eq!(
+        client
+            .get_tag("default", "ws-tag")
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+}
+
+#[tokio::test]
+async fn ensure_actor_recreates_an_actor_deleted_after_already_exists() {
+    let fake = FakeSubstrate::new();
+    let client = fake.start().await;
+    fake.state().put_actor("default", "a", ActorState::Deleting);
+    // The create sees the old actor, which is gone by the time it is read.
+    fake.state().fail("GetActor", [Status::not_found("gone")]);
+    fake.state().actors.clear();
+    fake.state()
+        .fail("CreateActor", [Status::already_exists("still there")]);
+    let actor = client
+        .ensure_actor("default", "a", "default", "tmpl")
+        .await
+        .unwrap();
+    assert_eq!(actor.metadata.unwrap().uid, "uid-default/a");
+    assert_eq!(fake.state().calls_of("CreateActor").len(), 2);
+}

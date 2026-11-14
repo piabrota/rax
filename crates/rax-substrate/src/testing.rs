@@ -39,6 +39,10 @@ pub struct State {
     pub created_templates: Vec<ActorTemplate>,
     /// Actors by "atespace/name".
     pub actors: BTreeMap<String, Actor>,
+    /// Egress policies by their actor's "atespace/name".
+    pub egress_policies: BTreeMap<String, EgressPolicy>,
+    /// Snapshot tags by "atespace/name".
+    pub tags: BTreeMap<String, Tag>,
     /// Every call, as "Method atespace/name".
     pub calls: Vec<String>,
     pub worker_ip: String,
@@ -64,6 +68,8 @@ impl Default for State {
             templates: BTreeMap::new(),
             created_templates: Vec::new(),
             actors: BTreeMap::new(),
+            egress_policies: BTreeMap::new(),
+            tags: BTreeMap::new(),
             calls: Vec::new(),
             worker_ip: DEFAULT_WORKER_IP.to_owned(),
             deleting_polls: 0,
@@ -156,14 +162,13 @@ fn actor(atespace: &str, name: &str, state: ActorState, worker_ip: Option<&str>)
 }
 
 fn set_state(a: &mut Actor, state: ActorState, worker_ip: Option<&str>) {
-    let (atespace, name) = a
-        .metadata
-        .as_ref()
-        .map(|m| (m.atespace.clone(), m.name.clone()))
-        .unwrap_or_default();
+    let meta = a.metadata.take().unwrap_or_default();
     let template = a.actor_template.take();
-    *a = actor(&atespace, &name, state, worker_ip);
+    let source_tag = a.source_tag.take();
+    *a = actor(&meta.atespace, &meta.name, state, worker_ip);
+    a.metadata = Some(meta);
     a.actor_template = template;
+    a.source_tag = source_tag;
 }
 
 fn not_found(what: &str, k: &str) -> Status {
@@ -276,8 +281,12 @@ impl Control for FakeSubstrate {
         &self,
         req: Request<CreateActorTemplateRequest>,
     ) -> Result<Response<ActorTemplate>, Status> {
-        let tmpl = req.get_ref().actor_template.clone().unwrap_or_default();
+        let mut tmpl = req.get_ref().actor_template.clone().unwrap_or_default();
         let k = meta_key(&tmpl.metadata);
+        let meta = tmpl.metadata.get_or_insert_with(Default::default);
+        if meta.uid.is_empty() {
+            meta.uid = format!("uid-{k}");
+        }
         let mut s = self.begin("CreateActorTemplate", &k, &req)?;
         if s.templates.contains_key(&k) {
             return Err(Status::already_exists(format!(
@@ -331,6 +340,33 @@ impl Control for FakeSubstrate {
             return Err(Status::already_exists(format!(
                 "actor {k:?} already exists"
             )));
+        }
+        if let Some(tag_ref) = &a.source_tag {
+            let tag_key = key(&tag_ref.atespace, &tag_ref.name);
+            let tag = s
+                .tags
+                .get(&tag_key)
+                .ok_or_else(|| not_found("source tag", &tag_key))?;
+            let tag_uid = tag
+                .status
+                .as_ref()
+                .map(|t| t.actor_template_uid.as_str())
+                .unwrap_or_default();
+            let tpl_uid = s
+                .templates
+                .get(&ref_key(&a.actor_template))
+                .and_then(|t| t.metadata.as_ref())
+                .map(|m| m.uid.as_str())
+                .unwrap_or_default();
+            if !tag_uid.is_empty() && !tpl_uid.is_empty() && tag_uid != tpl_uid {
+                return Err(Status::invalid_argument(format!(
+                    "source tag template uid {tag_uid:?} does not match actor template uid {tpl_uid:?}"
+                )));
+            }
+        }
+        let meta = a.metadata.get_or_insert_with(Default::default);
+        if meta.uid.is_empty() {
+            meta.uid = format!("uid-{k}");
         }
         a.status = Some(ActorStatus {
             state: ActorState::Suspended as i32,
@@ -454,6 +490,7 @@ impl Control for FakeSubstrate {
             lifecycle.stop(atespace, name);
         }
         let polls = s.deleting_polls;
+        s.egress_policies.remove(&k);
         let Some(a) = s.actors.get_mut(&k) else {
             return Err(not_found("actor", &k));
         };
@@ -465,5 +502,113 @@ impl Control for FakeSubstrate {
         let a = a.clone();
         s.deleting.insert(k, polls);
         Ok(Response::new(a))
+    }
+
+    async fn get_actor_egress_policy(
+        &self,
+        req: Request<GetActorEgressPolicyRequest>,
+    ) -> Result<Response<EgressPolicy>, Status> {
+        let k = ref_key(&req.get_ref().actor);
+        let s = self.begin("GetActorEgressPolicy", &k, &req)?;
+        if req.get_ref().name != "default" {
+            return Err(Status::invalid_argument(format!(
+                "name: Invalid value: {:?}: must be \"default\"",
+                req.get_ref().name
+            )));
+        }
+        s.egress_policies
+            .get(&k)
+            .cloned()
+            .map(Response::new)
+            .ok_or_else(|| Status::not_found(format!("actor {k} has no egress policy")))
+    }
+
+    async fn create_actor_egress_policy(
+        &self,
+        req: Request<CreateActorEgressPolicyRequest>,
+    ) -> Result<Response<EgressPolicy>, Status> {
+        let k = ref_key(&req.get_ref().actor);
+        let mut s = self.begin("CreateActorEgressPolicy", &k, &req)?;
+        if !s.actors.contains_key(&k) {
+            return Err(not_found("actor", &k));
+        }
+        if s.egress_policies.contains_key(&k) {
+            return Err(Status::already_exists(format!(
+                "actor {k} already has an egress policy"
+            )));
+        }
+        let policy = req.into_inner().egress_policy.unwrap_or_default();
+        s.egress_policies.insert(k, policy.clone());
+        Ok(Response::new(policy))
+    }
+
+    async fn create_tag(&self, req: Request<CreateTagRequest>) -> Result<Response<Tag>, Status> {
+        let mut tag = req.get_ref().tag.clone().unwrap_or_default();
+        let k = meta_key(&tag.metadata);
+        let mut s = self.begin("CreateTag", &k, &req)?;
+        if s.tags.contains_key(&k) {
+            return Err(Status::already_exists(format!("tag {k} already exists")));
+        }
+        let src_key = ref_key(&tag.source_actor);
+        let src = s
+            .actors
+            .get(&src_key)
+            .ok_or_else(|| not_found("actor", &src_key))?;
+        if src.status.as_ref().map(|st| st.state) != Some(ActorState::Suspended as i32) {
+            return Err(Status::failed_precondition(format!(
+                "source actor {src_key} must be suspended"
+            )));
+        }
+        let actor_template_uid = s
+            .templates
+            .get(&ref_key(&src.actor_template))
+            .and_then(|t| t.metadata.as_ref())
+            .map(|m| m.uid.clone())
+            .unwrap_or_default();
+        tag.status = Some(TagStatus {
+            actor_template_uid,
+            ..Default::default()
+        });
+        s.tags.insert(k, tag.clone());
+        Ok(Response::new(tag))
+    }
+
+    async fn get_tag(&self, req: Request<GetTagRequest>) -> Result<Response<Tag>, Status> {
+        let k = ref_key(&req.get_ref().tag);
+        let s = self.begin("GetTag", &k, &req)?;
+        s.tags
+            .get(&k)
+            .cloned()
+            .map(Response::new)
+            .ok_or_else(|| not_found("tag", &k))
+    }
+
+    async fn list_tags(
+        &self,
+        req: Request<ListTagsRequest>,
+    ) -> Result<Response<ListTagsResponse>, Status> {
+        let atespace = req.get_ref().atespace.clone();
+        let s = self.begin("ListTags", &atespace, &req)?;
+        let tags = s
+            .tags
+            .values()
+            .filter(|t| {
+                atespace.is_empty() || t.metadata.as_ref().is_some_and(|m| m.atespace == atespace)
+            })
+            .cloned()
+            .collect();
+        Ok(Response::new(ListTagsResponse {
+            tags,
+            next_page_token: String::new(),
+        }))
+    }
+
+    async fn delete_tag(&self, req: Request<DeleteTagRequest>) -> Result<Response<Tag>, Status> {
+        let k = ref_key(&req.get_ref().tag);
+        let mut s = self.begin("DeleteTag", &k, &req)?;
+        s.tags
+            .remove(&k)
+            .map(Response::new)
+            .ok_or_else(|| not_found("tag", &k))
     }
 }

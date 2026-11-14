@@ -229,34 +229,54 @@ mod tests {
                 name: "full".into(),
                 atespace: "default".into(),
                 create_time: Some(ts("2026-09-19T12:00:00Z")),
+                uid: "550e8400-e29b-41d4-a716-446655440000".into(),
+                labels: [("team".to_string(), "platform".to_string())].into(),
+                owner: "alice@example.com".into(),
+                update_time: Some(ts("2026-09-19T12:01:00Z")),
+                delete_time: Some(ts("2026-09-19T12:10:00Z")),
             }),
             spec: Some(TaskSpec {
-                image: "example.com/img:1".into(),
-                command: vec!["sh".into(), "-c".into(), "true".into()],
+                profile: Some(Profile {
+                    image: "example.com/img@sha256:deadbeef".into(),
+                    resources: Some(ResourcesSpec {
+                        limits: Some(ResourceList {
+                            cpu: "500m".into(),
+                            memory: "1Gi".into(),
+                        }),
+                    }),
+                    ate_actor_template: String::new(),
+                }),
+                commands: vec!["sh".into(), "-c".into(), "true".into()],
                 env: vec![EnvVar {
                     name: "A".into(),
                     value: "1".into(),
                 }],
-                resources: Some(ResourcesSpec {
-                    requests: Some(ResourceList {
-                        cpu: "500m".into(),
-                        memory: "1Gi".into(),
-                    }),
-                    limits: None,
-                }),
                 workspace: Some(WorkspaceRef {
                     name: "ws".into(),
                     path: "/workspace".into(),
                 }),
                 debug: true,
                 config: None,
+                goal: Some(Goal {
+                    spec: "Run verification suite".into(),
+                }),
+                retry: Some(RetryConfig {
+                    max_retries: 2,
+                    initial_backoff: Some(pbjson_types::Duration {
+                        seconds: 30,
+                        nanos: 0,
+                    }),
+                    max_backoff: Some(pbjson_types::Duration {
+                        seconds: 300,
+                        nanos: 0,
+                    }),
+                    backoff_multiplier: 2.0,
+                }),
                 gateway: Some(GatewayRef { name: "gw".into() }),
+                session_id: "sess-123".into(),
             }),
             status: Some(TaskStatus {
-                phase: "Running".into(),
-                id: "id-1".into(),
                 actor: "actor-1".into(),
-                worker_ip: "10.0.0.5:80".into(),
                 conditions: vec![Condition {
                     r#type: "Ready".into(),
                     status: "True".into(),
@@ -264,6 +284,28 @@ mod tests {
                     message: "ok".into(),
                     update_time: Some(ts("2026-09-19T12:05:00Z")),
                 }],
+                state: TaskState::Working.into(),
+                status_detail: Some(StatusDetail {
+                    reason: TaskStatusReason::SandboxCrashed.into(),
+                    detail: "OOMKilled".into(),
+                }),
+                outcome: Some(TaskOutcome {
+                    result: TaskResult::Succeeded.into(),
+                    status: Some(crate::google::rpc::Status {
+                        code: 0,
+                        message: "done".into(),
+                        details: vec![],
+                    }),
+                    exit_code: 0,
+                    output: "all checks passed".into(),
+                    structured_output: Some(st(json!({"passed": true}))),
+                }),
+                attempt: 1,
+                ate_actor_template: "ax-3f9c1a2b5d7e9f01".into(),
+                generation: 3,
+                resolved_argv: vec!["sh".into(), "-c".into(), "true".into()],
+                previous_failure: "exit status 1".into(),
+                actor_uid: String::new(),
             }),
         }
     }
@@ -279,9 +321,20 @@ mod tests {
     fn task_round_trip_and_shape() {
         let out = round_trip(&full_task());
         for want in [
-            "workerIP: 10.0.0.5:80",
-            "updateTime: 2026-09-19T12:05:00Z",
             "createTime: 2026-09-19T12:00:00Z",
+            "updateTime: 2026-09-19T12:01:00Z",
+            "deleteTime: 2026-09-19T12:10:00Z",
+            "sessionId: sess-123",
+            "initialBackoff: 30s",
+            "maxBackoff: 300s",
+            "backoffMultiplier: 2",
+            "state: TASK_STATE_WORKING",
+            "reason: TASK_STATUS_REASON_SANDBOX_CRASHED",
+            "result: TASK_RESULT_SUCCEEDED",
+            "structuredOutput:",
+            "ateActorTemplate: ax-3f9c1a2b5d7e9f01",
+            "resolvedArgv:",
+            "previousFailure: exit status 1",
         ] {
             assert!(out.contains(want), "yaml missing {want}:\n{out}");
         }
@@ -304,6 +357,72 @@ mod tests {
         );
         // Unset fields are omitted rather than rendered as null.
         assert!(!out.contains("null"), "{out}");
+    }
+
+    #[test]
+    fn task_rejects_removed_and_deferred_fields() {
+        for (src, want) in [
+            ("spec:\n  image: alpine\n", "image"),
+            ("spec:\n  command:\n    - sh\n", "command"),
+            (
+                "spec:\n  resources:\n    limits:\n      cpu: 1\n",
+                "resources",
+            ),
+            ("spec:\n  budget:\n    maxWallclock: 60s\n", "budget"),
+            ("spec:\n  parentTaskId: p1\n", "parentTaskId"),
+            (
+                "spec:\n  cascadeOnParentDelete: true\n",
+                "cascadeOnParentDelete",
+            ),
+            (
+                "spec:\n  profile:\n    resources:\n      requests:\n        cpu: 500m\n",
+                "requests",
+            ),
+            ("status:\n  phase: Running\n", "phase"),
+            ("status:\n  id: t-1\n", "id"),
+            ("status:\n  workerIP: 10.0.0.1\n", "workerIP"),
+            ("status:\n  parentTag: tag-1\n", "parentTag"),
+            ("status:\n  endTime: 2026-09-19T12:00:00Z\n", "endTime"),
+            ("status:\n  workingDuration: 30s\n", "workingDuration"),
+        ] {
+            let err = from_yaml::<Task>(&format!("kind: Task\n{src}"))
+                .expect_err(src)
+                .to_string();
+            assert!(err.contains(want), "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn workspace_rejects_removed_legacy_fields() {
+        for (src, want) in [
+            (
+                "spec:\n  git:\n    - repo: https://example.com/r.git\n",
+                "git",
+            ),
+            ("spec:\n  files:\n    - path: a.txt\n", "files"),
+            ("spec:\n  skills:\n    path: /.ax/skills\n", "skills"),
+            (
+                "spec:\n  setup:\n    git:\n      - repo: https://example.com/r.git\n        branch: main\n",
+                "branch",
+            ),
+            (
+                "spec:\n  profile:\n    resources:\n      requests:\n        cpu: 500m\n",
+                "requests",
+            ),
+            (
+                "spec:\n  profile:\n    snapshotFidelity: ROOTFS\n",
+                "snapshotFidelity",
+            ),
+            (
+                "spec:\n  profile:\n    workerSelector:\n      pool: gpu\n",
+                "workerSelector",
+            ),
+        ] {
+            let err = from_yaml::<Workspace>(&format!("kind: Workspace\n{src}"))
+                .expect_err(src)
+                .to_string();
+            assert!(err.contains(want), "{src}: {err}");
+        }
     }
 
     #[test]
@@ -370,34 +489,53 @@ metadata:
   name: full-ws
   atespace: default
 spec:
-  git:
-    - name: origin
-      repo: "https://github.com/chalk/chalk.git"
-      branch: "main"
-      dir: chalk
-      depth: 1
-  files:
-    - path: AGENTS.md
-      content: "# Agent Guidelines\nFollow best practices."
   mcp:
     registries:
       - provider: google
         query: "mcp.tags:build"
-  skills:
-    registries:
-      - provider: google
-        query: "skills.tags:golang"
-    path: "/.agents/skills"
+    servers:
+      - name: github-mcp
+        endpoint: "https://api.githubcopilot.com/mcp"
+  profile:
+    image: "us-docker.pkg.dev/proj/img@sha256:deadbeef"
+    resources:
+      limits:
+        cpu: "4"
+        memory: "8Gi"
+    ateActorTemplate: base-tmpl
+  setup:
+    git:
+      - name: origin
+        repo: "https://github.com/chalk/chalk.git"
+        dir: chalk
+        depth: 1
+        ref: "main"
+    files:
+      - path: AGENTS.md
+        content: "# Agent Guidelines\nFollow best practices."
+    skills:
+      registries:
+        - provider: google
+          query: "skills.tags:golang"
+      path: "/.agents/skills"
+    commands:
+      - "go mod download"
+    gateway:
+      name: setup-egress
+status:
+  phase: Ready
 "##,
         )
         .unwrap();
-        let spec = ws.spec.as_ref().unwrap();
-        assert_eq!(spec.git[0].depth, 1);
-        assert_eq!(spec.skills.as_ref().unwrap().path, "/.agents/skills");
+        let setup = ws.spec.as_ref().unwrap().setup.as_ref().unwrap();
+        assert_eq!(setup.git[0].depth, 1);
+        assert_eq!(setup.git[0].r#ref, "main");
+        assert_eq!(setup.skills.as_ref().unwrap().path, "/.agents/skills");
         assert_eq!(
-            spec.files[0].content,
+            setup.files[0].content,
             "# Agent Guidelines\nFollow best practices."
         );
+        assert_eq!(ws.status.as_ref().unwrap().phase, "Ready");
         round_trip(&ws);
     }
 
@@ -434,7 +572,7 @@ spec:
             metadata: Some(ObjectMeta {
                 name: "m".into(),
                 atespace: "default".into(),
-                create_time: None,
+                ..Default::default()
             }),
             spec: Some(ModelSpec {
                 provider: "google".into(),
@@ -466,8 +604,9 @@ kind: Task
 metadata:
   name: swe-bench-shard-07
 spec:
-  image: us-docker.pkg.dev/acme/evals/harness:2026.10
-  command: ["python3", "-m", "harness.run"]
+  profile:
+    image: us-docker.pkg.dev/acme/evals/harness:2026.10
+  commands: ["python3", "-m", "harness.run"]
   config:
     suite: swe_bench_verified
     shard: { index: 7, total: 32 }
@@ -630,14 +769,14 @@ spec:
 
     #[test]
     fn lenient_ignores_unknown_fields() {
-        let doc = "metadata:\n  name: t\n  atespace: default\n  futureMeta: x\nspec:\n  image: img\n  fieldFromTheFuture: 1\n  env:\n    - name: A\n      value: b\n      secret: true\n";
+        let doc = "metadata:\n  name: t\n  atespace: default\n  futureMeta: x\nspec:\n  profile:\n    image: img\n  fieldFromTheFuture: 1\n  env:\n    - name: A\n      value: b\n      secret: true\n";
         assert!(
             from_yaml::<Task>(doc).is_err(),
             "strict decoding should reject an unknown field"
         );
         let task: Task = from_yaml_lenient(doc).unwrap();
         let spec = task.spec.unwrap();
-        assert_eq!(spec.image, "img");
+        assert_eq!(spec.profile.unwrap().image, "img");
         assert_eq!(spec.env[0].value, "b");
     }
 

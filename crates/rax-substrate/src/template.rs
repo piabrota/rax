@@ -7,9 +7,14 @@ use rax_api::{DEFAULT_TASK_IMAGE, parse_cpu_millicores, parse_memory_bytes};
 
 use crate::ateapi::{
     ActorTemplate, Container, DurableDirVolumeSource, EnvVar, HttpGetAction, ResourceMetadata,
-    ResourceRequirements, Resources, SnapshotConfig, SnapshotFidelity, Volume, VolumeMount,
-    WakeupProbe,
+    ResourceRequirements, Resources, SnapshotConfig, SnapshotFidelity, SystemInfoDataSource,
+    SystemInfoVolumeSource, TrustBundleDataSource, Volume, VolumeMount, WakeupProbe,
 };
+
+/// The trust bundles every task sandbox gets at
+/// [`rax_api::EGRESS_TRUST_BUNDLE_PATH`]: the egress gateway's TLS
+/// interceptor and Substrate's built-in public roots.
+pub const EGRESS_TRUST_BUNDLES: [&str; 2] = ["egress-mitm.ate.dev", "system-roots.ate.dev"];
 
 /// The command the guest container runs when a template names none.
 pub const DEFAULT_GUEST_COMMAND: &str = "/usr/local/bin/ax-task-runner";
@@ -18,9 +23,8 @@ pub const DEFAULT_CPU_MILLICORES: i64 = 1000;
 /// The memory limit (512 MiB) for a task that sets none.
 pub const DEFAULT_MEMORY_BYTES: i64 = 512 << 20;
 
-/// Translates a task's resource limits into a template's resources. Substrate
-/// sizes a sandbox by limits alone, so requests are ignored (validation
-/// rejects them). Returns `None` when no limit is set, so the template gets
+/// Translates a profile's resource limits into a template's resources.
+/// Substrate sizes a sandbox by limits alone. Returns `None` when no limit is set, so the template gets
 /// the default limits; a limit that does not parse keeps its default.
 pub fn resource_limits(reqs: Option<&ResourcesSpec>) -> Option<ResourceRequirements> {
     let limits = reqs.and_then(|r| r.limits.as_ref())?;
@@ -41,8 +45,8 @@ pub fn resource_limits(reqs: Option<&ResourcesSpec>) -> Option<ResourceRequireme
 }
 
 /// Builds the template every task actor runs from: one `guest` container
-/// with a `/readyz` wakeup probe and a durable `/workspace` volume,
-/// snapshotted at volume fidelity. Empty arguments take their defaults, and
+/// with a `/readyz` wakeup probe, a durable `/workspace` volume and the egress
+/// trust bundle, snapshotted at volume fidelity. Empty arguments take their defaults, and
 /// missing resource limits take [`DEFAULT_CPU_MILLICORES`] and
 /// [`DEFAULT_MEMORY_BYTES`].
 ///
@@ -84,6 +88,10 @@ pub fn build_actor_template(
         .filter(|&m| m > 0)
         .unwrap_or(DEFAULT_MEMORY_BYTES);
 
+    let (bundle_dir, bundle_file) = rax_api::EGRESS_TRUST_BUNDLE_PATH
+        .rsplit_once('/')
+        .expect("the trust bundle path is absolute");
+
     ActorTemplate {
         metadata: Some(ResourceMetadata {
             atespace: atespace.to_owned(),
@@ -108,17 +116,40 @@ pub fn build_actor_template(
                 }),
                 ..Default::default()
             }),
-            volume_mounts: vec![VolumeMount {
+            volume_mounts: vec![
+                VolumeMount {
+                    name: "workspace".to_owned(),
+                    mount_path: "/workspace".to_owned(),
+                },
+                VolumeMount {
+                    name: "egress-trust-bundle".to_owned(),
+                    mount_path: bundle_dir.to_owned(),
+                },
+            ],
+            ..Default::default()
+        }],
+        volumes: vec![
+            Volume {
                 name: "workspace".to_owned(),
-                mount_path: "/workspace".to_owned(),
-            }],
-            ..Default::default()
-        }],
-        volumes: vec![Volume {
-            name: "workspace".to_owned(),
-            durable_dir: Some(DurableDirVolumeSource {}),
-            ..Default::default()
-        }],
+                durable_dir: Some(DurableDirVolumeSource {}),
+                ..Default::default()
+            },
+            // Mounted for every task, with or without a gateway, so that TLS
+            // verifies whether or not something on the way out intercepts it.
+            Volume {
+                name: "egress-trust-bundle".to_owned(),
+                system_info: Some(SystemInfoVolumeSource {
+                    data_sources: vec![SystemInfoDataSource {
+                        trust_bundle: Some(TrustBundleDataSource {
+                            names: EGRESS_TRUST_BUNDLES.map(String::from).to_vec(),
+                            path: bundle_file.to_owned(),
+                        }),
+                        ..Default::default()
+                    }],
+                }),
+                ..Default::default()
+            },
+        ],
         snapshot_config: Some(SnapshotConfig {
             storage_location: snapshots_bucket.to_owned(),
             preferred_fidelity: SnapshotFidelity::Volumes as i32,
@@ -162,6 +193,22 @@ mod tests {
         assert_eq!((probe.path.as_str(), probe.port), ("/readyz", 80));
         assert_eq!(c.volume_mounts[0].mount_path, "/workspace");
         assert!(tmpl.volumes[0].durable_dir.is_some());
+        // Every task trusts the egress gateway's interceptor and the public
+        // roots, at the path the runner points its CA variables at.
+        assert_eq!(c.volume_mounts[1].name, "egress-trust-bundle");
+        assert_eq!(
+            c.volume_mounts[1].mount_path,
+            "/run/ate/egress-trust-bundle"
+        );
+        let bundle = tmpl.volumes[1].system_info.as_ref().unwrap().data_sources[0]
+            .trust_bundle
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            bundle.names,
+            ["egress-mitm.ate.dev", "system-roots.ate.dev"]
+        );
+        assert_eq!(bundle.path, "trust-bundle.pem");
         let snap = tmpl.snapshot_config.as_ref().unwrap();
         // Empty by default, so Substrate 1.0 uses its cluster-wide location.
         assert_eq!(snap.storage_location, "");
@@ -199,7 +246,6 @@ mod tests {
                 cpu: cpu.into(),
                 memory: memory.into(),
             }),
-            ..Default::default()
         };
         assert_eq!(resource_limits(None), None);
         assert_eq!(resource_limits(Some(&ResourcesSpec::default())), None);

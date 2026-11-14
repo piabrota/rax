@@ -1,7 +1,7 @@
 //! Task storage and Substrate.
 //!
 //! The store keeps only what AX itself knows about a task. Its actor, the
-//! worker it runs on, and the phase and Ready condition that follow from the
+//! actor's UID, and the state and Ready condition that follow from the
 //! actor's state are read from Substrate whenever a task is fetched.
 //!
 //! The service reaches task records only through [`Tasks`], which drops the
@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use pbjson_types::Timestamp;
-use rax_api::v1alpha1::{Condition, Task, TaskStatus};
-use rax_api::{condition, phase, reason};
+use rax_api::v1alpha1::{Condition, StatusDetail, Task, TaskState, TaskStatus, TaskStatusReason};
+use rax_api::{condition, is_ax_task_state, reason};
 use rax_store::{Result, TaskStore};
 use tonic::Status;
 
@@ -100,16 +100,34 @@ impl Tasks {
             .await
     }
 
+    /// Sets or clears metadata.deleteTime on the task's record.
+    pub async fn set_delete_time(
+        &self,
+        atespace: &str,
+        name: &str,
+        delete_time: Option<Timestamp>,
+    ) -> Result<()> {
+        self.store
+            .set_task_delete_time(atespace, name, delete_time)
+            .await
+    }
+
+    /// Returns a task as stored, without its Substrate-owned status.
+    pub async fn get_stored(&self, atespace: &str, name: &str) -> Result<Task> {
+        self.store.get_task(atespace, name).await
+    }
+
     /// Removes a task's actor and templates from Substrate, then its record
     /// from the store.
     pub async fn delete(
         &self,
         reconciler: Option<&dyn Reconciler>,
-        atespace: &str,
-        name: &str,
+        task: &Task,
     ) -> Result<(), Status> {
+        let meta = task.metadata.clone().unwrap_or_default();
+        let (atespace, name) = (meta.atespace.as_str(), meta.name.as_str());
         if let Some(r) = reconciler
-            && let Err(e) = r.delete(atespace, name).await
+            && let Err(e) = r.delete(task).await
         {
             return Err(match e.code() {
                 tonic::Code::Unknown => Status::internal(format!(
@@ -147,31 +165,43 @@ fn task_name(t: &Task) -> &str {
     t.metadata.as_ref().map_or("", |m| m.name.as_str())
 }
 
-/// Overlays the actor's state on the task's status: actor, workerIP, and,
-/// unless the phase is one of AX's own, the phase and Ready condition.
-/// `actor` is `Ok(None)` when the task has no actor, and an error when the
-/// actor could not be looked up, in which case the task is reported with
-/// phase Unknown.
+/// Overlays the actor's state on the task's status: actor name, actor UID,
+/// and, unless the state is one of AX's own or deletion is in progress, the
+/// state and Ready condition. `actor` is `Ok(None)` when the task has no
+/// actor, and an error when the actor could not be looked up, in which case
+/// Ready is reported as Unknown.
 pub(crate) fn set_actor_status(task: &mut Task, actor: Result<Option<&Actor>, &Status>) {
+    let terminating = task
+        .metadata
+        .as_ref()
+        .is_some_and(|m| m.delete_time.is_some());
+    let name = task_name_of(task);
     let st = task.status.get_or_insert_with(Default::default);
     st.actor.clear();
-    st.worker_ip.clear();
-    let ax_phase = phase::is_ax_phase(&st.phase);
+    st.actor_uid.clear();
+    let ax_state = is_ax_task_state(st.state());
+    let deleting =
+        |st: &mut TaskStatus| set_ready(st, "False", reason::TERMINATING, "Task is being deleted");
 
     match actor {
         Err(e) => {
-            tracing::warn!(task = task_name_of(task), error = %e.message(), "could not read task actor");
-            if !ax_phase {
-                let st = task.status.as_mut().unwrap();
-                st.phase = phase::UNKNOWN.into();
+            tracing::warn!(task = name, error = %e.message(), "could not read task actor");
+            if terminating {
+                return deleting(st);
+            }
+            if !ax_state {
+                st.set_state(TaskState::Unspecified);
                 set_ready(st, "Unknown", reason::SUBSTRATE_UNAVAILABLE, e.message());
             }
         }
         // A task that finished provisioning always has an actor, so a missing
         // one was removed outside AX.
         Ok(None) => {
-            if !ax_phase {
-                st.phase = phase::FAILED.into();
+            if terminating {
+                return deleting(st);
+            }
+            if !ax_state {
+                st.set_state(TaskState::Failed);
                 set_ready(
                     st,
                     "False",
@@ -182,13 +212,20 @@ pub(crate) fn set_actor_status(task: &mut Task, actor: Result<Option<&Actor>, &S
         }
         Ok(Some(actor)) => {
             st.actor = actor.name.clone();
-            st.worker_ip = actor.worker_ip.clone();
-            if ax_phase {
+            st.actor_uid = actor.uid.clone();
+            if terminating {
+                if !ax_state {
+                    st.set_state(actor_task_state(actor.state).0);
+                }
+                return deleting(st);
+            }
+            if ax_state {
                 return;
             }
-            st.phase = actor_phase(actor.state).into();
-            match st.phase.as_str() {
-                phase::RUNNING => {
+            let (state, ready_reason) = actor_task_state(actor.state);
+            st.set_state(state);
+            match ready_reason {
+                reason::TASK_RUNNING => {
                     if condition_true(st, condition::WORKSPACE_READY) {
                         set_ready(
                             st,
@@ -205,15 +242,15 @@ pub(crate) fn set_actor_status(task: &mut Task, actor: Result<Option<&Actor>, &S
                         );
                     }
                 }
-                phase::UNKNOWN => {
+                reason::UNKNOWN => {
                     set_ready(
                         st,
                         "Unknown",
-                        phase::UNKNOWN,
+                        reason::UNKNOWN,
                         &format!("Actor is in state {}", actor.state.name()),
                     );
                 }
-                // The task is not ready, and its phase says why.
+                // The task is not ready, and the reason says why.
                 _ => {
                     let message = if actor.crash_message.is_empty() {
                         let name = actor.state.name();
@@ -224,8 +261,13 @@ pub(crate) fn set_actor_status(task: &mut Task, actor: Result<Option<&Actor>, &S
                     } else {
                         actor.crash_message.clone()
                     };
-                    let p = st.phase.clone();
-                    set_ready(st, "False", &p, &message);
+                    if actor.state == ActorState::Crashed && st.status_detail.is_none() {
+                        st.status_detail = Some(StatusDetail {
+                            reason: TaskStatusReason::SandboxCrashed.into(),
+                            detail: message.clone(),
+                        });
+                    }
+                    set_ready(st, "False", ready_reason, &message);
                 }
             }
         }
@@ -241,16 +283,17 @@ fn task_name_of(task: &Task) -> String {
     )
 }
 
-/// Maps an actor's state to the task's phase.
-fn actor_phase(state: ActorState) -> &'static str {
+/// Maps an actor's state to the task's state and the reason of its Ready
+/// condition.
+fn actor_task_state(state: ActorState) -> (TaskState, &'static str) {
     match state {
-        ActorState::Running => phase::RUNNING,
-        ActorState::Resuming | ActorState::Reverting => phase::RESUMING,
-        ActorState::Suspending => phase::SUSPENDING,
-        ActorState::Suspended => phase::SUSPENDED,
-        ActorState::Crashed => phase::FAILED,
-        ActorState::Deleting => phase::TERMINATING,
-        ActorState::Unspecified | ActorState::Other(_) => phase::UNKNOWN,
+        ActorState::Running => (TaskState::Working, reason::TASK_RUNNING),
+        ActorState::Resuming | ActorState::Reverting => (TaskState::Queued, reason::RESUMING),
+        ActorState::Suspending => (TaskState::Suspending, reason::SUSPENDING),
+        ActorState::Suspended => (TaskState::Suspended, reason::SUSPENDED),
+        ActorState::Crashed => (TaskState::Failed, reason::FAILED),
+        ActorState::Deleting => (TaskState::Unspecified, reason::TERMINATING),
+        ActorState::Unspecified | ActorState::Other(_) => (TaskState::Unspecified, reason::UNKNOWN),
     }
 }
 
@@ -286,15 +329,16 @@ fn set_ready(st: &mut TaskStatus, status: &str, reason: &str, message: &str) {
     });
 }
 
-/// Returns the part of a task's status that AX owns and stores. The actor, its
-/// worker, and the phase and Ready condition that follow from the actor's
-/// state are dropped.
+/// Returns the part of a task's status that AX owns and stores. The actor,
+/// its UID, and the state, status detail and Ready condition that follow from
+/// the actor's live state are dropped.
 pub(crate) fn stored_status(st: Option<&TaskStatus>) -> TaskStatus {
     let mut out = st.cloned().unwrap_or_default();
     out.actor.clear();
-    out.worker_ip.clear();
-    if !phase::is_ax_phase(&out.phase) {
-        out.phase.clear();
+    out.actor_uid.clear();
+    if !is_ax_task_state(out.state()) {
+        out.set_state(TaskState::Unspecified);
+        out.status_detail = None;
         out.conditions.retain(|c| c.r#type != condition::READY);
     }
     out
@@ -305,27 +349,29 @@ pub(crate) mod tests {
     use super::*;
     use rax_api::v1alpha1::ObjectMeta;
 
-    pub fn actor(name: &str, state: ActorState, worker_ip: &str) -> Actor {
+    pub fn actor(name: &str, state: ActorState) -> Actor {
         Actor {
             name: name.into(),
+            uid: String::new(),
             state,
-            worker_ip: worker_ip.into(),
+            worker_ip: String::new(),
             crash_message: String::new(),
         }
     }
 
-    fn stored_task(name: &str, phase: &str, conditions: Vec<Condition>) -> Task {
+    fn stored_task(name: &str, state: TaskState, conditions: Vec<Condition>) -> Task {
+        let mut status = TaskStatus {
+            conditions,
+            ..Default::default()
+        };
+        status.set_state(state);
         Task {
             metadata: Some(ObjectMeta {
                 name: name.into(),
                 atespace: "default".into(),
-                create_time: None,
-            }),
-            status: Some(TaskStatus {
-                phase: phase.into(),
-                conditions,
                 ..Default::default()
             }),
+            status: Some(status),
             ..Default::default()
         }
     }
@@ -350,43 +396,36 @@ pub(crate) mod tests {
     #[test]
     fn actor_status() {
         let ws_ready = || vec![cond("WorkspaceReady", "True", "")];
-        let mut crashed = actor("crashed", ActorState::Crashed, "");
+        let mut crashed = actor("crashed", ActorState::Crashed);
         crashed.crash_message = "OOMKilled".into();
         use ActorState::*;
-        /// The stored task and its actor, then the phase, worker IP, actor and
-        /// Ready status and reason the task should be reported with.
-        type Case<'a> = (
-            Task,
-            Option<Actor>,
-            &'a str,
-            &'a str,
-            &'a str,
-            &'a str,
-            &'a str,
-        );
+        use TaskState as T;
+        /// The stored task and its actor, then the state, actor and Ready
+        /// status and reason the task should be reported with.
+        type Case<'a> = (Task, Option<Actor>, TaskState, &'a str, &'a str, &'a str);
         #[rustfmt::skip]
         let cases: Vec<Case> = vec![
-            (stored_task("running", "", ws_ready()), Some(actor("running", Running, "10.0.0.5")), "Running", "10.0.0.5", "running", "True", reason::TASK_RUNNING),
-            (stored_task("setting-up", "", vec![]), Some(actor("setting-up", Running, "10.0.0.6")), "Running", "10.0.0.6", "setting-up", "False", reason::WORKSPACE_INITIALIZING),
-            (stored_task("suspended", "", ws_ready()), Some(actor("suspended", Suspended, "")), "Suspended", "", "suspended", "False", phase::SUSPENDED),
-            (stored_task("crashed", "", vec![]), Some(crashed.clone()), phase::FAILED, "", "crashed", "False", phase::FAILED),
-            (stored_task("reverting", "", vec![]), Some(actor("reverting", Reverting, "")), phase::RESUMING, "", "reverting", "False", phase::RESUMING),
-            (stored_task("suspending", "", vec![]), Some(actor("suspending", Suspending, "")), phase::SUSPENDING, "", "suspending", "False", phase::SUSPENDING),
-            (stored_task("deleting", "", vec![]), Some(actor("deleting", Deleting, "")), phase::TERMINATING, "", "deleting", "False", phase::TERMINATING),
-            (stored_task("odd", "", vec![]), Some(actor("odd", Unspecified, "")), phase::UNKNOWN, "", "odd", "Unknown", phase::UNKNOWN),
+            (stored_task("running", T::Unspecified, ws_ready()), Some(actor("running", Running)), T::Working, "running", "True", reason::TASK_RUNNING),
+            (stored_task("setting-up", T::Unspecified, vec![]), Some(actor("setting-up", Running)), T::Working, "setting-up", "False", reason::WORKSPACE_INITIALIZING),
+            (stored_task("suspended", T::Unspecified, ws_ready()), Some(actor("suspended", Suspended)), T::Suspended, "suspended", "False", reason::SUSPENDED),
+            (stored_task("crashed", T::Unspecified, vec![]), Some(crashed.clone()), T::Failed, "crashed", "False", reason::FAILED),
+            (stored_task("reverting", T::Unspecified, vec![]), Some(actor("reverting", Reverting)), T::Queued, "reverting", "False", reason::RESUMING),
+            (stored_task("suspending", T::Unspecified, vec![]), Some(actor("suspending", Suspending)), T::Suspending, "suspending", "False", reason::SUSPENDING),
+            (stored_task("deleting", T::Unspecified, vec![]), Some(actor("deleting", Deleting)), T::Unspecified, "deleting", "False", reason::TERMINATING),
+            (stored_task("odd", T::Unspecified, vec![]), Some(actor("odd", Unspecified)), T::Unspecified, "odd", "Unknown", reason::UNKNOWN),
             // The actor was removed outside AX.
-            (stored_task("gone", "", vec![]), None, phase::FAILED, "", "", "False", reason::ACTOR_NOT_FOUND),
-            // Phases that describe AX's own work are kept, and so is their Ready reason.
-            (stored_task("failed", phase::FAILED, vec![cond("Ready", "False", reason::ACTOR_RESUME_FAILED)]), Some(actor("failed", Suspended, "")), phase::FAILED, "", "failed", "False", reason::ACTOR_RESUME_FAILED),
-            (stored_task("not-yet", phase::PENDING, vec![]), None, phase::PENDING, "", "", "", ""),
+            (stored_task("gone", T::Unspecified, vec![]), None, T::Failed, "", "False", reason::ACTOR_NOT_FOUND),
+            // States that describe AX's own work are kept, and so is their Ready reason.
+            (stored_task("failed", T::Failed, vec![cond("Ready", "False", reason::ACTOR_RESUME_FAILED)]), Some(actor("failed", Suspended)), T::Failed, "failed", "False", reason::ACTOR_RESUME_FAILED),
+            (stored_task("not-yet", T::Queued, vec![]), None, T::Queued, "", "", ""),
         ];
-        for (mut task, a, want_phase, want_ip, want_actor, want_ready, want_reason) in cases {
+        for (mut task, a, want_state, want_actor, want_ready, want_reason) in cases {
             let name = task_name(&task).to_owned();
             set_actor_status(&mut task, Ok(a.as_ref()));
             let st = task.status.as_ref().unwrap();
             assert_eq!(
-                (st.phase.as_str(), st.worker_ip.as_str(), st.actor.as_str()),
-                (want_phase, want_ip, want_actor),
+                (st.state(), st.actor.as_str()),
+                (want_state, want_actor),
                 "{name}"
             );
             if want_ready.is_empty() {
@@ -400,16 +439,20 @@ pub(crate) mod tests {
             );
         }
 
-        let mut task = stored_task("crashed", "", vec![]);
+        // A crash is reported in the Ready message and the status detail.
+        let mut task = stored_task("crashed", T::Unspecified, vec![]);
         set_actor_status(&mut task, Ok(Some(&crashed)));
         assert_eq!(ready(&task).unwrap().message, "OOMKilled");
+        let detail = task.status.as_ref().unwrap().status_detail.clone().unwrap();
+        assert_eq!(detail.reason(), TaskStatusReason::SandboxCrashed);
+        assert_eq!(detail.detail, "OOMKilled");
 
-        let mut task = stored_task("suspended", "", vec![]);
-        set_actor_status(&mut task, Ok(Some(&actor("suspended", Suspended, ""))));
+        let mut task = stored_task("suspended", T::Unspecified, vec![]);
+        set_actor_status(&mut task, Ok(Some(&actor("suspended", Suspended))));
         assert_eq!(ready(&task).unwrap().message, "Actor is suspended");
         let first = ready(&task).unwrap().update_time;
         std::thread::sleep(std::time::Duration::from_millis(2));
-        set_actor_status(&mut task, Ok(Some(&actor("suspended", Suspended, ""))));
+        set_actor_status(&mut task, Ok(Some(&actor("suspended", Suspended))));
         assert_eq!(
             ready(&task).unwrap().update_time,
             first,
@@ -420,41 +463,78 @@ pub(crate) mod tests {
     #[test]
     fn substrate_error_reports_unknown() {
         let err = Status::permission_denied("denied");
-        let mut task = stored_task("a", "", vec![]);
-        let mut terminating = stored_task("b", phase::TERMINATING, vec![]);
+        let mut task = stored_task("a", TaskState::Unspecified, vec![]);
+        let mut terminating = stored_task("b", TaskState::Unspecified, vec![]);
+        terminating.metadata.as_mut().unwrap().delete_time = Some(now());
         set_actor_status(&mut task, Err(&err));
         set_actor_status(&mut terminating, Err(&err));
-        assert_eq!(task.status.as_ref().unwrap().phase, "Unknown");
+        assert_eq!(
+            task.status.as_ref().unwrap().state(),
+            TaskState::Unspecified
+        );
         let c = ready(&task).unwrap();
         assert_eq!(
             (c.status.as_str(), c.reason.as_str()),
             ("Unknown", reason::SUBSTRATE_UNAVAILABLE)
         );
-        assert_eq!(terminating.status.unwrap().phase, phase::TERMINATING);
+        assert_eq!(rax_api::format_task_state(&terminating), "Terminating");
+        let c = ready(&terminating).unwrap();
+        assert_eq!(
+            (c.status.as_str(), c.reason.as_str()),
+            ("False", reason::TERMINATING)
+        );
+    }
+
+    #[test]
+    fn actor_uid_is_read_never_kept() {
+        let mut current = actor("a", ActorState::Running);
+        current.uid = "uid-new".into();
+        let err = Status::unavailable("unavailable");
+        for (name, a, want) in [
+            ("current actor", Ok(Some(&current)), "uid-new"),
+            (
+                "actor without UID",
+                Ok(Some(&actor("a", ActorState::Running))),
+                "",
+            ),
+            ("missing actor", Ok(None), ""),
+            ("unreachable substrate", Err(&err), ""),
+        ] {
+            let mut task = stored_task("a", TaskState::Unspecified, vec![]);
+            task.status.as_mut().unwrap().actor_uid = "uid-old".into();
+            set_actor_status(&mut task, a);
+            assert_eq!(task.status.unwrap().actor_uid, want, "{name}");
+        }
     }
 
     #[test]
     fn stored_status_keeps_only_ax_state() {
-        let input = TaskStatus {
-            id: "id".into(),
-            phase: "Running".into(),
+        let mut input = TaskStatus {
+            attempt: 1,
             actor: "actor".into(),
-            worker_ip: "10.0.0.1".into(),
+            actor_uid: "uid".into(),
+            status_detail: Some(StatusDetail::default()),
             conditions: vec![cond("Ready", "", ""), cond("WorkspaceReady", "", "")],
+            ..Default::default()
         };
+        input.set_state(TaskState::Working);
         let got = stored_status(Some(&input));
-        assert_eq!(got.id, "id");
-        assert!(got.phase.is_empty() && got.actor.is_empty() && got.worker_ip.is_empty());
+        assert_eq!(got.attempt, 1);
+        assert_eq!(got.state(), TaskState::Unspecified);
+        assert!(got.actor.is_empty() && got.actor_uid.is_empty());
+        assert!(got.status_detail.is_none());
         assert_eq!(got.conditions.len(), 1);
         assert_eq!(got.conditions[0].r#type, "WorkspaceReady");
 
-        let input = TaskStatus {
-            phase: phase::FAILED.into(),
+        let mut input = TaskStatus {
+            status_detail: Some(StatusDetail::default()),
             conditions: vec![cond("Ready", "", "")],
             ..Default::default()
         };
+        input.set_state(TaskState::Failed);
         let got = stored_status(Some(&input));
-        assert_eq!(got.phase, phase::FAILED);
+        assert_eq!(got.state(), TaskState::Failed);
+        assert!(got.status_detail.is_some());
         assert_eq!(got.conditions.len(), 1);
         assert_eq!(stored_status(None), TaskStatus::default());
     }

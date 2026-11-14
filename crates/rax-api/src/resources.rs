@@ -1,11 +1,10 @@
 //! Resource requirements.
 //!
-//! `spec.resources.limits` is copied onto the Substrate ActorTemplate, which
-//! enforces the same rules as below: cpu and memory only, each quantity greater
-//! than zero, and a cpu limit below 1000 cores. Checking them here means a bad
-//! value fails at apply time instead of when the template is created.
-//! Substrate sizes a sandbox by limits alone, so requests are rejected rather
-//! than accepted and ignored.
+//! A profile's `resources.limits` is copied onto the Substrate ActorTemplate,
+//! which enforces the same rules as below: cpu and memory only, each quantity
+//! greater than zero, and a cpu limit below 1000 cores. Checking them here
+//! means a bad value fails at apply time instead of when the template is
+//! created.
 
 use std::sync::LazyLock;
 
@@ -20,26 +19,27 @@ use crate::v1alpha1::ResourcesSpec;
 /// The exclusive upper bound Substrate places on a cpu limit.
 pub const MAX_CPU_LIMIT_CORES: i64 = 1000;
 
-/// Reports the first problem with a task's resource requirements. A missing or
-/// empty value is valid: the sandbox is then sized by its worker's defaults.
+/// Reports the first problem with a profile's resource requirements. A
+/// missing or empty value is valid: omitted cpu and memory limits default to 1
+/// CPU (1000m) and 512Mi when the ActorTemplate is built.
 pub fn validate_resources(reqs: Option<&ResourcesSpec>) -> Result<(), ValidationError> {
-    let Some(reqs) = reqs else { return Ok(()) };
-    if let Some(req) = &reqs.requests
-        && (!req.cpu.is_empty() || !req.memory.is_empty())
-    {
-        return Err(ValidationError::new(
-            "spec.resources.requests: not supported, only spec.resources.limits is applied to the sandbox",
-        ));
-    }
-    let Some(limits) = &reqs.limits else {
+    validate_resources_at("spec.profile.resources", reqs)
+}
+
+pub(crate) fn validate_resources_at(
+    field: &str,
+    reqs: Option<&ResourcesSpec>,
+) -> Result<(), ValidationError> {
+    let Some(limits) = reqs.and_then(|r| r.limits.as_ref()) else {
         return Ok(());
     };
     if !limits.cpu.is_empty() {
-        parse_cpu_millicores(&limits.cpu).map_err(|e| e.prefixed("spec.resources.limits.cpu"))?;
+        parse_cpu_millicores(&limits.cpu)
+            .map_err(|e| e.prefixed(&format!("{field}.limits.cpu")))?;
     }
     if !limits.memory.is_empty() {
         parse_memory_bytes(&limits.memory)
-            .map_err(|e| e.prefixed("spec.resources.limits.memory"))?;
+            .map_err(|e| e.prefixed(&format!("{field}.limits.memory")))?;
     }
     Ok(())
 }
@@ -170,7 +170,7 @@ fn parse_decimal(s: &str) -> Option<BigRational> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v1alpha1::{ObjectMeta, ResourceList, Task, TaskSpec};
+    use crate::v1alpha1::{ObjectMeta, Profile, ResourceList, Task, TaskSpec};
 
     fn limits(cpu: &str, memory: &str) -> ResourcesSpec {
         ResourcesSpec {
@@ -178,7 +178,6 @@ mod tests {
                 cpu: cpu.into(),
                 memory: memory.into(),
             }),
-            ..Default::default()
         }
     }
 
@@ -202,35 +201,11 @@ mod tests {
             assert!(validate_resources(reqs.as_ref()).is_ok(), "{name}");
         }
 
-        let requests = |cpu: &str, memory: &str, lim: Option<ResourceList>| ResourcesSpec {
-            requests: Some(ResourceList {
-                cpu: cpu.into(),
-                memory: memory.into(),
-            }),
-            limits: lim,
-        };
         let bad: Vec<(&str, ResourcesSpec, &str)> = vec![
-            (
-                "requests are not supported",
-                requests(
-                    "500m",
-                    "",
-                    Some(ResourceList {
-                        cpu: "2".into(),
-                        memory: "".into(),
-                    }),
-                ),
-                "spec.resources.requests: not supported",
-            ),
-            (
-                "memory request alone",
-                requests("", "1Gi", None),
-                "spec.resources.requests: not supported",
-            ),
             (
                 "cpu zero",
                 limits("0", ""),
-                r#"spec.resources.limits.cpu: "0" must be greater than zero"#,
+                r#"spec.profile.resources.limits.cpu: "0" must be greater than zero"#,
             ),
             (
                 "cpu zero millicores",
@@ -245,7 +220,7 @@ mod tests {
             (
                 "cpu at bound",
                 limits("1000", ""),
-                r#"spec.resources.limits.cpu: "1000" must be less than 1000 cores"#,
+                r#"spec.profile.resources.limits.cpu: "1000" must be less than 1000 cores"#,
             ),
             (
                 "cpu over bound via suffix",
@@ -265,7 +240,7 @@ mod tests {
             (
                 "cpu not a quantity",
                 limits("two", ""),
-                r#"spec.resources.limits.cpu: invalid quantity "two""#,
+                r#"spec.profile.resources.limits.cpu: invalid quantity "two""#,
             ),
             ("cpu bad suffix", limits("2cores", ""), "invalid quantity"),
             ("cpu double dot", limits("1.2.3", ""), "invalid quantity"),
@@ -273,7 +248,7 @@ mod tests {
             (
                 "memory zero",
                 limits("", "0Gi"),
-                r#"spec.resources.limits.memory: "0Gi" must be greater than zero"#,
+                r#"spec.profile.resources.limits.memory: "0Gi" must be greater than zero"#,
             ),
             (
                 "memory negative",
@@ -283,7 +258,7 @@ mod tests {
             (
                 "memory lowercase suffix",
                 limits("", "4gi"),
-                r#"spec.resources.limits.memory: invalid quantity "4gi""#,
+                r#"spec.profile.resources.limits.memory: invalid quantity "4gi""#,
             ),
             (
                 "memory bytes suffix",
@@ -314,7 +289,10 @@ mod tests {
                 ..Default::default()
             }),
             spec: Some(TaskSpec {
-                resources: Some(r),
+                profile: Some(Profile {
+                    resources: Some(r),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -322,7 +300,7 @@ mod tests {
         let err = crate::validate_task(&task(limits("abc", "")))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("spec.resources.limits.cpu"), "{err}");
+        assert!(err.contains("spec.profile.resources.limits.cpu"), "{err}");
         crate::validate_task(&task(limits("2", "4Gi"))).unwrap();
     }
 

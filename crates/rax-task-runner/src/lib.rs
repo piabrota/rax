@@ -48,14 +48,17 @@ mod tests {
 
     #[test]
     fn ignores_unknown_fields() {
-        let f = write("metadata:\n  name: t\nspec:\n  image: img\n  futureField: true\n");
+        let f =
+            write("metadata:\n  name: t\nspec:\n  profile:\n    image: img\n  futureField: true\n");
         let task: Task = load_spec(Some(f.path()), "UNUSED").unwrap().unwrap();
         assert_eq!(task.metadata.unwrap().name, "t");
-        assert_eq!(task.spec.unwrap().image, "img");
+        assert_eq!(task.spec.unwrap().profile.unwrap().image, "img");
 
-        let f = write("metadata:\n  name: ws\nspec:\n  files:\n  - path: a\n    mode: 0644\n");
+        let f = write(
+            "metadata:\n  name: ws\nspec:\n  setup:\n    files:\n    - path: a\n      mode: 0644\n",
+        );
         let ws: Workspace = load_spec(Some(f.path()), "UNUSED").unwrap().unwrap();
-        assert_eq!(ws.spec.unwrap().files[0].path, "a");
+        assert_eq!(ws.spec.unwrap().setup.unwrap().files[0].path, "a");
     }
 
     #[test]

@@ -2,12 +2,15 @@
 //! per-task actor template it runs from, and its workspace readiness.
 
 use std::collections::BTreeMap;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use rax_api::v1alpha1::{Condition, Task, TaskSpec, TaskStatus, Workspace};
+use rax_api::v1alpha1::{
+    Condition, Gateway, Profile, ResourcesSpec, Task, TaskSpec, TaskStatus, Workspace,
+};
 use rax_api::{
-    DEFAULT_SYSTEM_NAMESPACE, DEFAULT_TASK_IMAGE, condition, reason, to_yaml, validate_resources,
+    DEFAULT_ATESPACE, DEFAULT_SYSTEM_NAMESPACE, DEFAULT_TASK_IMAGE, condition, reason, to_yaml,
+    validate_resources,
 };
 use rax_substrate::ateapi;
 use rax_substrate::probe::HttpProbe;
@@ -16,6 +19,7 @@ use sha2::{Digest, Sha256};
 use tonic::{Code, Status};
 use tracing::{info, warn};
 
+use crate::profile::effective_profile;
 use crate::tasks::now;
 use crate::{Actor, ActorState, Actors, Reconciler};
 
@@ -28,7 +32,8 @@ pub struct ControllerOptions {
     /// The fallback template, as `name` or `atespace/name`.
     pub default_template: String,
     pub default_template_atespace: String,
-    /// The image for tasks that leave `spec.image` empty.
+    /// The image for tasks whose effective profile sets neither an image nor
+    /// an `ateActorTemplate`.
     pub default_task_image: String,
     /// How long to wait for a freshly resumed actor to finish workspace
     /// setup before recording it as still initializing.
@@ -157,6 +162,29 @@ fn router_url(addr: &str) -> String {
     format!("{}/readyz?check=workspace", base.trim_end_matches('/'))
 }
 
+/// A gateway's egress rules as the Substrate client's type. AX's API and the
+/// client each generate Substrate's messages, so they are converted by their
+/// shared wire encoding.
+fn egress_rules(gw: &Gateway) -> Vec<ateapi::EgressRule> {
+    use prost::Message;
+    gw.spec
+        .as_ref()
+        .map(|s| s.egress.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .map(|r| {
+            ateapi::EgressRule::decode(r.encode_to_vec().as_slice())
+                .expect("the same message decodes from its own encoding")
+        })
+        .collect()
+}
+
+/// The bound workspace's profile, if any.
+fn workspace_profile(ws: Option<&Workspace>) -> Option<&Profile> {
+    ws.and_then(|w| w.spec.as_ref())
+        .and_then(|s| s.profile.as_ref())
+}
+
 /// The task's atespace and name, which is also its actor's name.
 fn atespace_and_name(task: &Task) -> (String, String) {
     let meta = task.metadata.as_ref();
@@ -261,30 +289,44 @@ impl TaskReconciler {
 }
 
 impl TaskReconciler {
-    /// Fills in the task's defaults and makes sure its atespace,
+    /// Resolves the task's effective profile and makes sure its atespace,
     /// ActorTemplate and actor exist on Substrate. It records only what AX
-    /// stores in the task's status: the task ID, and on failure the reason in
-    /// a False Ready condition.
+    /// stores in the task's status: the template the actor runs from, the
+    /// resolved argv, and on failure the reason in a False Ready condition.
     async fn ensure_substrate_resources(
         &self,
         task: &mut Task,
-        workspace: Option<Workspace>,
+        workspace: Option<&Workspace>,
     ) -> Result<(), Status> {
         let meta = task.metadata.get_or_insert_with(Default::default);
         if meta.atespace.is_empty() {
-            meta.atespace = "default".into();
+            meta.atespace = DEFAULT_ATESPACE.into();
         }
         let (atespace, name) = (meta.atespace.clone(), meta.name.clone());
-        let spec = task.spec.get_or_insert_with(TaskSpec::default);
-        if spec.image.is_empty() {
-            spec.image = self.opts.default_task_image.clone();
-        }
-        let image = spec.image.clone();
+        task.spec.get_or_insert_with(TaskSpec::default);
         task.status.get_or_insert_with(Default::default);
-        info!(
-            name,
-            atespace, image, "ensuring Substrate resources for task"
+        let effective = effective_profile(
+            workspace_profile(workspace),
+            task.spec.as_ref().unwrap().profile.as_ref(),
         );
+
+        // Limits are enforced by the template, so they are checked here as
+        // well as on apply: a task must never run without limits it asked for.
+        if effective.ate_actor_template.is_empty()
+            && let Err(e) = validate_resources(effective.resources.as_ref())
+        {
+            let st = task.status.as_mut().unwrap();
+            set_condition(
+                st,
+                condition::READY,
+                "False",
+                reason::INVALID_RESOURCES,
+                e.to_string(),
+            );
+            return Err(Status::invalid_argument(format!(
+                "validating resources: {e}"
+            )));
+        }
 
         // 1. The atespace.
         if let Err(e) = self.client.ensure_atespace(&atespace).await {
@@ -302,20 +344,82 @@ impl TaskReconciler {
         // used interchangeably (for example in the router's
         // ate-target-actor header).
         let actor = name.clone();
-        {
-            let st = task.status.as_mut().unwrap();
-            if st.id.is_empty() {
-                let secs = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or_default();
-                st.id = format!("task-{name}-{secs}");
+
+        // 3. The template: an existing one the profile names, or one made
+        // for the task.
+        let (template_atespace, template) = if !effective.ate_actor_template.is_empty() {
+            let tpl = effective.ate_actor_template.clone();
+            info!(
+                name,
+                atespace,
+                template = tpl,
+                "reconciling task with existing ActorTemplate"
+            );
+            if let Err(e) = self.client.get_actor_template(&atespace, &tpl).await {
+                let msg = e.message().to_owned();
+                return Err(fail(
+                    task,
+                    &e,
+                    "getting actor template",
+                    reason::TEMPLATE_CREATION_FAILED,
+                    msg,
+                ));
             }
+            (atespace.clone(), tpl)
+        } else {
+            let image = if effective.image.is_empty() {
+                self.opts.default_task_image.clone()
+            } else {
+                effective.image.clone()
+            };
+            info!(name, atespace, image, "reconciling task");
+            self.ensure_task_template(
+                task,
+                workspace,
+                &atespace,
+                &image,
+                effective.resources.as_ref(),
+            )
+            .await?
+        };
+
+        if let Err(e) = self
+            .client
+            .ensure_actor(&atespace, &actor, &template_atespace, &template)
+            .await
+        {
+            let msg = e.to_string();
+            return Err(fail(
+                task,
+                &e,
+                "ensuring actor",
+                reason::ACTOR_CREATION_FAILED,
+                msg,
+            ));
         }
 
-        // 3. The template: the task's environment, the task itself without
-        // its status (status changes must not make new templates), and the
-        // bound workspace.
+        let commands = task.spec.as_ref().unwrap().commands.clone();
+        let st = task.status.as_mut().unwrap();
+        st.ate_actor_template = template;
+        if !commands.is_empty() && st.resolved_argv.is_empty() {
+            st.resolved_argv = commands;
+        }
+        Ok(())
+    }
+
+    /// Makes sure the per-task template exists: the profile's image and
+    /// limits, the task's environment, the task itself without its status
+    /// (status changes must not make new templates), and the bound
+    /// workspace. Returns its atespace and name.
+    async fn ensure_task_template(
+        &self,
+        task: &mut Task,
+        workspace: Option<&Workspace>,
+        atespace: &str,
+        image: &str,
+        resources: Option<&ResourcesSpec>,
+    ) -> Result<(String, String), Status> {
+        let name = atespace_and_name(task).1;
         let spec = task.spec.as_ref().unwrap();
         let mut env: BTreeMap<String, String> = spec
             .env
@@ -323,43 +427,32 @@ impl TaskReconciler {
             .filter(|e| !e.name.is_empty())
             .map(|e| (e.name.clone(), e.value.clone()))
             .collect();
-        let launch = Task {
+        // Neither status nor lifecycle timestamps belong in the template.
+        let mut launch = Task {
             status: None,
             ..task.clone()
         };
+        if let Some(m) = launch.metadata.as_mut() {
+            m.update_time = None;
+            m.delete_time = None;
+        }
         if let Ok(y) = to_yaml(&launch) {
             env.insert("AX_TASK_YAML".into(), y);
         }
-        if let Some(ws) = &workspace
+        if let Some(ws) = workspace
             && let Ok(y) = to_yaml(ws)
         {
             env.insert("AX_WORKSPACE_YAML".into(), y);
         }
+        let limits = resource_limits(resources);
 
-        // Limits are enforced by the template, so they are checked here as
-        // well as on apply: a task must never run without limits it asked for.
-        if let Err(e) = validate_resources(spec.resources.as_ref()) {
-            let st = task.status.as_mut().unwrap();
-            set_condition(
-                st,
-                condition::READY,
-                "False",
-                reason::INVALID_RESOURCES,
-                e.to_string(),
-            );
-            return Err(Status::invalid_argument(format!(
-                "validating resources: {e}"
-            )));
-        }
-        let resources = resource_limits(spec.resources.as_ref());
-
-        let template = task_template_name(&name, &image, &env);
+        let template = task_template_name(&name, image, &env);
         info!(image, template, "ensuring ActorTemplate for task");
-        // spec.resources is in AX_TASK_YAML, so a limits change is part of
-        // the digest and makes a new template.
+        // The profile's resources are in AX_TASK_YAML or AX_WORKSPACE_YAML,
+        // so a limits change is part of the digest and makes a new template.
         let tmpl = match self
             .client
-            .ensure_actor_template(&atespace, &template, &image, resources.as_ref(), &env)
+            .ensure_actor_template(atespace, &template, image, limits.as_ref(), &env)
             .await
         {
             Ok(t) => t,
@@ -378,7 +471,7 @@ impl TaskReconciler {
                 ));
             }
         };
-        let (template_atespace, template) = match tmpl.metadata {
+        Ok(match tmpl.metadata {
             Some(m) => (m.atespace, m.name),
             None => match self.opts.default_template.split_once('/') {
                 Some((a, n)) => (a.to_owned(), n.to_owned()),
@@ -387,43 +480,93 @@ impl TaskReconciler {
                     self.opts.default_template.clone(),
                 ),
             },
-        };
+        })
+    }
 
-        if let Err(e) = self
-            .client
-            .ensure_actor(&atespace, &actor, &template_atespace, &template)
-            .await
-        {
-            let msg = e.to_string();
-            return Err(fail(
-                task,
-                &e,
-                "ensuring actor",
-                reason::ACTOR_CREATION_FAILED,
-                msg,
-            ));
+    /// Makes sure the actor of a task bound to a Gateway has egress rules.
+    /// An actor that has rules keeps them; one without gets the gateway's,
+    /// or binding fails when the gateway is gone. A failure is recorded the
+    /// way [`ensure_substrate_resources`](Self::ensure_substrate_resources)
+    /// records its own.
+    async fn bind_gateway(&self, task: &mut Task, gateway: Option<&Gateway>) -> Result<(), Status> {
+        let gw_name = task
+            .spec
+            .as_ref()
+            .and_then(|s| s.gateway.as_ref())
+            .map(|g| g.name.clone())
+            .unwrap_or_default();
+        if gw_name.is_empty() {
+            return Ok(());
         }
-
-        Ok(())
+        let (atespace, actor) = atespace_and_name(task);
+        let err = match self.client.get_actor_egress_policy(&atespace, &actor).await {
+            Ok(_) => return Ok(()),
+            Err(e) if e.code() != Code::NotFound => e,
+            Err(_) => match gateway {
+                None => SubstrateError::new(
+                    "",
+                    Status::failed_precondition(format!("not available in atespace {atespace:?}")),
+                ),
+                Some(gw) => {
+                    let rules = egress_rules(gw);
+                    match self
+                        .client
+                        .ensure_actor_egress_policy(&atespace, &actor, &rules)
+                        .await
+                    {
+                        Ok(()) => return Ok(()),
+                        Err(e) => e,
+                    }
+                }
+            },
+        };
+        let msg = format!("gateway {gw_name:?}: {}", err.message());
+        Err(fail(
+            task,
+            &err,
+            &format!("binding gateway {gw_name:?}"),
+            reason::GATEWAY_BINDING_FAILED,
+            msg,
+        ))
     }
 }
 
 #[async_trait]
 impl Reconciler for TaskReconciler {
-    async fn suspend(&self, task: &mut Task, workspace: Option<Workspace>) -> Result<(), Status> {
-        self.ensure_substrate_resources(task, workspace).await?;
+    async fn suspend(
+        &self,
+        task: &mut Task,
+        workspace: Option<Workspace>,
+        gateway: Option<Gateway>,
+    ) -> Result<(), Status> {
+        let prev = task.status.clone();
+        self.ensure_substrate_resources(task, workspace.as_ref())
+            .await?;
         let (atespace, actor) = atespace_and_name(task);
         info!(actor, "suspending actor on Substrate");
-        self.client
-            .suspend_actor(&atespace, &actor)
-            .await
-            .map_err(|e| e.context("suspending actor").to_status())?;
+        if let Err(e) = self.client.suspend_actor(&atespace, &actor).await {
+            task.status = prev;
+            return Err(e.context("suspending actor").to_status());
+        }
+        if let Err(e) = self.bind_gateway(task, gateway.as_ref()).await {
+            task.status
+                .get_or_insert_with(Default::default)
+                .ate_actor_template = prev.map(|p| p.ate_actor_template).unwrap_or_default();
+            return Err(e);
+        }
         info!(actor, "task suspended");
         Ok(())
     }
 
-    async fn resume(&self, task: &mut Task, workspace: Option<Workspace>) -> Result<(), Status> {
-        self.ensure_substrate_resources(task, workspace).await?;
+    async fn resume(
+        &self,
+        task: &mut Task,
+        workspace: Option<Workspace>,
+        gateway: Option<Gateway>,
+    ) -> Result<(), Status> {
+        self.ensure_substrate_resources(task, workspace.as_ref())
+            .await?;
+        self.bind_gateway(task, gateway.as_ref()).await?;
         let (atespace, actor) = atespace_and_name(task);
         info!(actor, "resuming actor on Substrate worker");
         let worker = match self.client.resume_actor(&atespace, &actor).await {
@@ -470,17 +613,33 @@ impl Reconciler for TaskReconciler {
         Ok(())
     }
 
-    async fn delete(&self, atespace: &str, name: &str) -> Result<(), Status> {
+    async fn delete(&self, task: &Task) -> Result<(), Status> {
+        let (atespace, name) = atespace_and_name(task);
         let atespace = if atespace.is_empty() {
-            "default"
+            DEFAULT_ATESPACE
         } else {
-            atespace
+            &atespace
         };
+        let name = name.as_str();
         info!(atespace, task = name, "deleting Substrate actor for task");
         self.client
             .delete_actor(atespace, name)
             .await
             .map_err(|e| e.to_status())?;
+        // A task that runs from a template of its own leaves it alone.
+        let template = task
+            .status
+            .as_ref()
+            .map_or("", |s| s.ate_actor_template.as_str());
+        let own_template = task
+            .spec
+            .as_ref()
+            .and_then(|s| s.profile.as_ref())
+            .is_some_and(|p| !p.ate_actor_template.is_empty())
+            || (!template.is_empty() && !is_task_template(name, template));
+        if own_template {
+            return Ok(());
+        }
         if let Err(e) = self.delete_task_templates(atespace, name).await {
             warn!(task = name, error = %e, "could not clean up actor templates for task");
         }
@@ -521,6 +680,11 @@ fn to_actor(a: &ateapi::Actor) -> Actor {
             .metadata
             .as_ref()
             .map(|m| m.name.clone())
+            .unwrap_or_default(),
+        uid: a
+            .metadata
+            .as_ref()
+            .map(|m| m.uid.clone())
             .unwrap_or_default(),
         state: actor_state(status.map_or(0, |s| s.state)),
         worker_ip: worker_ip(a),

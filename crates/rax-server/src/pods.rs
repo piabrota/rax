@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use http::{Method, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
-use rax_api::v1alpha1::{Condition, Task, TaskSpec, TaskStatus, Workspace};
+use rax_api::v1alpha1::{Condition, Gateway, Task, TaskSpec, TaskStatus, Workspace};
 use rax_api::{DEFAULT_TASK_IMAGE, condition, reason, to_yaml, validate_resources};
 use rax_substrate::tls::{self, TlsOptions};
 use rustls::ClientConfig;
@@ -32,6 +32,7 @@ use serde_json::{Value, json};
 use tonic::Status;
 use tracing::info;
 
+use crate::profile::effective_profile;
 use crate::tasks::now;
 use crate::{Actor, ActorState, Actors, Reconciler};
 
@@ -229,7 +230,7 @@ impl KubeClient {
 pub struct PodOptions {
     /// The namespace every task pod runs in.
     pub namespace: String,
-    /// The image for tasks that leave `spec.image` empty.
+    /// The image for tasks whose profile leaves `image` empty.
     pub default_task_image: String,
     /// Secrets whose keys become every task's environment variables.
     pub env_from_secrets: Vec<String>,
@@ -282,10 +283,16 @@ pub fn pod_manifest(
     let atespace = atespace_of(task);
     let default_spec = TaskSpec::default();
     let spec = task.spec.as_ref().unwrap_or(&default_spec);
-    let image = if spec.image.is_empty() {
+    let profile = effective_profile(
+        workspace
+            .and_then(|w| w.spec.as_ref())
+            .and_then(|s| s.profile.as_ref()),
+        spec.profile.as_ref(),
+    );
+    let image = if profile.image.is_empty() {
         &opts.default_task_image
     } else {
-        &spec.image
+        &profile.image
     };
 
     let mut env: Vec<Value> = spec
@@ -294,10 +301,14 @@ pub fn pod_manifest(
         .filter(|e| !e.name.is_empty())
         .map(|e| json!({"name": e.name, "value": e.value}))
         .collect();
-    let launch = Task {
+    let mut launch = Task {
         status: None,
         ..task.clone()
     };
+    if let Some(m) = launch.metadata.as_mut() {
+        m.update_time = None;
+        m.delete_time = None;
+    }
     env.push(json!({"name": "AX_TASK_NAME", "value": name}));
     env.push(json!({"name": "AX_TASK_ATESPACE", "value": atespace}));
     if let Ok(y) = to_yaml(&launch) {
@@ -309,7 +320,7 @@ pub fn pod_manifest(
         env.push(json!({"name": "AX_WORKSPACE_YAML", "value": y}));
     }
 
-    let limits = spec.resources.as_ref().and_then(|r| r.limits.as_ref());
+    let limits = profile.resources.as_ref().and_then(|r| r.limits.as_ref());
     let pick = |v: Option<&String>, default: &String| {
         v.filter(|s| !s.is_empty()).unwrap_or(default).clone()
     };
@@ -333,8 +344,8 @@ pub fn pod_manifest(
             "seccompProfile": {"type": "RuntimeDefault"},
         },
     });
-    if !spec.command.is_empty() {
-        container["command"] = json!(spec.command);
+    if !spec.commands.is_empty() {
+        container["command"] = json!(spec.commands);
     }
 
     let mut pod_spec = json!({
@@ -407,6 +418,10 @@ pub fn pod_actor(pod: &Value) -> Actor {
     };
     Actor {
         name,
+        uid: pod["metadata"]["uid"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
         state,
         worker_ip: status["podIP"].as_str().unwrap_or_default().to_owned(),
         crash_message,
@@ -508,26 +523,26 @@ fn fail(task: &mut Task, err: &KubeError, context: &str, failed_reason: &str) ->
 }
 
 impl PodRunner {
-    /// Fills in the task's defaults and ID, checks its limits, and lists the
-    /// pods it has run in.
-    async fn prepare(&self, task: &mut Task, failed_reason: &str) -> Result<Vec<Value>, Status> {
+    /// Fills in the task's defaults, checks its profile's limits and that it
+    /// binds no gateway, and lists the pods it has run in.
+    async fn prepare(
+        &self,
+        task: &mut Task,
+        workspace: Option<&Workspace>,
+        failed_reason: &str,
+    ) -> Result<Vec<Value>, Status> {
         let atespace = atespace_of(task);
         task.metadata.get_or_insert_with(Default::default).atespace = atespace.clone();
         let name = task.metadata.as_ref().unwrap().name.clone();
-        let spec = task.spec.get_or_insert_with(TaskSpec::default);
-        if spec.image.is_empty() {
-            spec.image = self.opts.default_task_image.clone();
-        }
-        let resources = spec.resources.clone();
+        let spec = task.spec.get_or_insert_with(TaskSpec::default).clone();
+        let profile = effective_profile(
+            workspace
+                .and_then(|w| w.spec.as_ref())
+                .and_then(|s| s.profile.as_ref()),
+            spec.profile.as_ref(),
+        );
         let st = task.status.get_or_insert_with(Default::default);
-        if st.id.is_empty() {
-            let secs = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or_default();
-            st.id = format!("task-{name}-{secs}");
-        }
-        if let Err(e) = validate_resources(resources.as_ref()) {
+        if let Err(e) = validate_resources(profile.resources.as_ref()) {
             set_condition(
                 st,
                 condition::READY,
@@ -539,6 +554,24 @@ impl PodRunner {
                 "validating resources: {e}"
             )));
         }
+        // A pod has no egress gateway, so it could not keep to the rules.
+        if let Some(gw) = spec.gateway.as_ref().filter(|g| !g.name.is_empty()) {
+            let msg = format!(
+                "gateway {:?}: the pod runner cannot enforce egress rules; run on Agent Substrate",
+                gw.name
+            );
+            set_condition(
+                st,
+                condition::READY,
+                "False",
+                reason::GATEWAY_BINDING_FAILED,
+                msg.clone(),
+            );
+            return Err(Status::failed_precondition(msg));
+        }
+        if !spec.commands.is_empty() && st.resolved_argv.is_empty() {
+            st.resolved_argv = spec.commands.clone();
+        }
         self.pods(&atespace, Some(&name))
             .await
             .map_err(|e| fail(task, &e, "listing the task's pods", failed_reason))
@@ -548,8 +581,15 @@ impl PodRunner {
 #[async_trait]
 impl Reconciler for PodRunner {
     /// Stops a run in progress and keeps finished pods for their logs.
-    async fn suspend(&self, task: &mut Task, _workspace: Option<Workspace>) -> Result<(), Status> {
-        let pods = self.prepare(task, reason::ACTOR_CREATION_FAILED).await?;
+    async fn suspend(
+        &self,
+        task: &mut Task,
+        workspace: Option<Workspace>,
+        _gateway: Option<Gateway>,
+    ) -> Result<(), Status> {
+        let pods = self
+            .prepare(task, workspace.as_ref(), reason::ACTOR_CREATION_FAILED)
+            .await?;
         let running: Vec<Value> = pods.into_iter().filter(|p| !is_finished(p)).collect();
         if !running.is_empty() {
             info!(
@@ -565,8 +605,15 @@ impl Reconciler for PodRunner {
 
     /// Keeps a run in progress; otherwise a new pod replaces the finished
     /// ones.
-    async fn resume(&self, task: &mut Task, workspace: Option<Workspace>) -> Result<(), Status> {
-        let pods = self.prepare(task, reason::ACTOR_RESUME_FAILED).await?;
+    async fn resume(
+        &self,
+        task: &mut Task,
+        workspace: Option<Workspace>,
+        _gateway: Option<Gateway>,
+    ) -> Result<(), Status> {
+        let pods = self
+            .prepare(task, workspace.as_ref(), reason::ACTOR_RESUME_FAILED)
+            .await?;
         if pods.first().is_none_or(is_finished) {
             if let Err(e) = self.delete_pods(&pods).await {
                 return Err(fail(
@@ -611,12 +658,10 @@ impl Reconciler for PodRunner {
         Ok(())
     }
 
-    async fn delete(&self, atespace: &str, name: &str) -> Result<(), Status> {
-        let atespace = if atespace.is_empty() {
-            "default"
-        } else {
-            atespace
-        };
+    async fn delete(&self, task: &Task) -> Result<(), Status> {
+        let atespace = atespace_of(task);
+        let atespace = atespace.as_str();
+        let name = task.metadata.as_ref().map_or("", |m| m.name.as_str());
         info!(atespace, task = name, "deleting the task's pods");
         let pods = self
             .pods(atespace, Some(name))
@@ -670,6 +715,7 @@ impl Actors for PodRunner {
     fn absent_actor(&self, name: &str) -> Option<Actor> {
         Some(Actor {
             name: name.to_owned(),
+            uid: String::new(),
             state: ActorState::Suspended,
             worker_ip: String::new(),
             crash_message: String::new(),
@@ -688,7 +734,6 @@ mod tests {
     use rax_api::v1alpha1::{EnvVar, ObjectMeta, ResourceList, ResourcesSpec};
 
     use super::*;
-    use rax_api::phase;
 
     /// A fake Kubernetes API that keeps pods in memory: list by label,
     /// create (as Pending, with increasing creation times) and delete.
@@ -789,7 +834,7 @@ mod tests {
         }
     }
 
-    fn task(name: &str, phase: &str) -> Task {
+    fn task(name: &str) -> Task {
         Task {
             metadata: Some(ObjectMeta {
                 name: name.into(),
@@ -797,18 +842,18 @@ mod tests {
                 ..Default::default()
             }),
             spec: Some(TaskSpec {
-                image: "ghcr.io/piabrota/agents:1".into(),
-                command: vec!["agent".into(), "health-digest".into()],
+                profile: Some(rax_api::v1alpha1::Profile {
+                    image: "ghcr.io/piabrota/agents:1".into(),
+                    ..Default::default()
+                }),
+                commands: vec!["agent".into(), "health-digest".into()],
                 env: vec![EnvVar {
                     name: "MODEL".into(),
                     value: "haiku".into(),
                 }],
                 ..Default::default()
             }),
-            status: Some(TaskStatus {
-                phase: phase.into(),
-                ..Default::default()
-            }),
+            status: Some(TaskStatus::default()),
             ..Default::default()
         }
     }
@@ -824,7 +869,7 @@ mod tests {
 
     #[test]
     fn the_pod_carries_the_task() {
-        let pod = pod_manifest(&task("digest", phase::RUNNING), None, &opts(), 42);
+        let pod = pod_manifest(&task("digest"), None, &opts(), 42);
         assert_eq!(pod["metadata"]["name"], "ops-digest-42");
         assert_eq!(pod["metadata"]["namespace"], "ax-tasks");
         assert_eq!(pod["metadata"]["labels"][LABEL_TASK], "digest");
@@ -852,16 +897,15 @@ mod tests {
 
     #[test]
     fn the_task_limits_and_image_win_over_the_defaults() {
-        let mut t = task("digest", phase::RUNNING);
+        let mut t = task("digest");
         let spec = t.spec.as_mut().unwrap();
-        spec.image.clear();
-        spec.command.clear();
-        spec.resources = Some(ResourcesSpec {
+        spec.profile.as_mut().unwrap().image.clear();
+        spec.commands.clear();
+        spec.profile.as_mut().unwrap().resources = Some(ResourcesSpec {
             limits: Some(ResourceList {
                 cpu: String::new(),
                 memory: "768Mi".into(),
             }),
-            ..Default::default()
         });
         let o = PodOptions {
             service_account: "agents".into(),
@@ -955,16 +999,19 @@ mod tests {
         let runner = PodRunner::new(serve(api.clone()).await, opts());
 
         // Created: suspended, no pod.
-        runner.suspend(&mut task("digest", ""), None).await.unwrap();
+        runner
+            .suspend(&mut task("digest"), None, None)
+            .await
+            .unwrap();
         assert!(api.names().is_empty());
         let a = runner.get_actor("ops", "digest").await.unwrap().unwrap();
         assert_eq!(a.state, ActorState::Suspended);
 
         // Resumed: one pod; resuming again while it runs keeps it.
-        let mut t = task("digest", "");
-        runner.resume(&mut t, None).await.unwrap();
+        let mut t = task("digest");
+        runner.resume(&mut t, None, None).await.unwrap();
         let st = t.status.as_ref().unwrap();
-        assert_eq!(st.phase, "", "the phase is the server's to set");
+        assert_eq!(st.state(), rax_api::v1alpha1::TaskState::Unspecified);
         assert!(
             st.conditions
                 .iter()
@@ -973,24 +1020,36 @@ mod tests {
         let first = api.names();
         assert_eq!(first.len(), 1);
         assert!(first[0].starts_with("ops-digest-"), "{first:?}");
-        runner.resume(&mut task("digest", ""), None).await.unwrap();
+        runner
+            .resume(&mut task("digest"), None, None)
+            .await
+            .unwrap();
         assert_eq!(api.names(), first);
 
         // It ends: the task reads as suspended, and the pod stays for its logs.
         api.set_phase(&first[0], "Succeeded", json!({}));
         let a = runner.get_actor("ops", "digest").await.unwrap().unwrap();
         assert_eq!(a.state, ActorState::Suspended);
-        runner.suspend(&mut task("digest", ""), None).await.unwrap();
+        runner
+            .suspend(&mut task("digest"), None, None)
+            .await
+            .unwrap();
         assert_eq!(api.names(), first);
 
         // Resumed again: the old pod goes, a new one runs.
-        runner.resume(&mut task("digest", ""), None).await.unwrap();
+        runner
+            .resume(&mut task("digest"), None, None)
+            .await
+            .unwrap();
         let second = api.names();
         assert_eq!(second.len(), 1);
         assert_ne!(second, first);
 
         // Suspended while running: the pod is deleted.
-        runner.suspend(&mut task("digest", ""), None).await.unwrap();
+        runner
+            .suspend(&mut task("digest"), None, None)
+            .await
+            .unwrap();
         assert!(api.names().is_empty());
     }
 
@@ -998,8 +1057,8 @@ mod tests {
     async fn listing_and_deleting_follow_the_labels() {
         let api = FakeApi::default();
         let runner = PodRunner::new(serve(api.clone()).await, opts());
-        runner.resume(&mut task("a", ""), None).await.unwrap();
-        runner.resume(&mut task("b", ""), None).await.unwrap();
+        runner.resume(&mut task("a"), None, None).await.unwrap();
+        runner.resume(&mut task("b"), None, None).await.unwrap();
         let names = api.names();
         api.set_phase(&names[0], "Failed", json!({"containerStatuses": [{"state": {"terminated": {"exitCode": 1, "reason": "Error"}}}]}));
 
@@ -1016,7 +1075,14 @@ mod tests {
         );
         assert!(runner.list_actors("other").await.unwrap().is_empty());
 
-        runner.delete("ops", "a").await.unwrap();
+        runner
+            .delete(&{
+                let mut t = task("a");
+                t.metadata.as_mut().unwrap().atespace = "ops".into();
+                t
+            })
+            .await
+            .unwrap();
         assert_eq!(api.names(), vec![names[1].clone()]);
     }
 
@@ -1024,8 +1090,8 @@ mod tests {
     async fn an_unreachable_api_is_worth_retrying() {
         // Nothing listens on port 1.
         let runner = PodRunner::new(KubeClient::plaintext("127.0.0.1", 1), opts());
-        let mut t = task("digest", "");
-        let err = runner.resume(&mut t, None).await.unwrap_err();
+        let mut t = task("digest");
+        let err = runner.resume(&mut t, None, None).await.unwrap_err();
         // The server records Pending for an Unavailable error.
         assert_eq!(err.code(), tonic::Code::Unavailable);
         let st = t.status.unwrap();

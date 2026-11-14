@@ -25,10 +25,18 @@ message ObjectMeta {
   string name = 1;
   string atespace = 2;
   google.protobuf.Timestamp create_time = 3;
+  // Server-assigned UUID.
+  string uid = 4;
+  // Arbitrary key-value labels.
+  map<string, string> labels = 5;
+  // Authenticated creator identity.
+  string owner = 6;
+  google.protobuf.Timestamp update_time = 7;
+  // Set while resource deletion is in progress.
+  google.protobuf.Timestamp delete_time = 8;
 }
 
 message ResourcesSpec {
-  ResourceList requests = 1;
   ResourceList limits = 2;
 }
 
@@ -43,4 +51,25 @@ message Condition {
   google.protobuf.Timestamp update_time = 3;
   string reason = 4;
   string message = 5;
+}
+
+// Profile defines the compute environment that maps 1:1 to a shared Substrate
+// ActorTemplate (ax-<sha256[:16]>) within an atespace. AX-managed templates
+// synthesized from a Profile default to ROOTFS snapshot fidelity
+// (SNAPSHOT_FIDELITY_ROOTFS) so root filesystem changes made during workspace
+// setup persist across snapshots.
+message Profile {
+  // Container image (Substrate requires @sha256 digest pinning on templates).
+  string image = 1;
+  // Sandbox compute resource limits (CPU and memory).
+  ResourcesSpec resources = 2;
+  // Optional name of an existing Substrate ActorTemplate in the same atespace
+  // to use directly instead of generating an AX-managed template. Mutually
+  // exclusive with image and resources. Because AX does not synthesize or
+  // mutate a user-supplied template, it must already satisfy the AX sandbox
+  // contract (/usr/local/bin/ax-task-runner entrypoint, HTTP /readyz wakeup
+  // probe on port 80, durable /workspace volume, and the egress-trust-bundle
+  // SystemInfo mount at /run/ate/egress-trust-bundle/trust-bundle.pem when
+  // outbound HTTPS traverses a Gateway).
+  string ate_actor_template = 3;
 }

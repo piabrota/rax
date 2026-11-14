@@ -97,7 +97,7 @@ pub const SSH_USAGE: &str = r#"Usage:
   rax ssh <task-name> [-- command...]
 
 Run a command inside a running task's container, or /bin/sh when no command is
-given. The task must be Running and have spec.debug: true.
+given. The task must be Working and have spec.debug: true.
 
 Examples:
   rax ssh task123

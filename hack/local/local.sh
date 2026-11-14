@@ -366,7 +366,7 @@ worker_ko_ref() {
 substrate_images() {
   local worker
   worker="$(worker_ko_ref)"
-  printf '%s\n' ateapi atecontroller atelet atenet "${worker##*/}" podcertcontroller objectstore-plugin envoy-dataplane
+  printf '%s\n' ateapi atecontroller atelet atenet "${worker##*/}" podcertcontroller objectstore-plugin envoy-dataplane kubernetes-secrets
 }
 
 # image_digest prints the digest the registry holds for repo:tag, where repo
@@ -496,7 +496,8 @@ deploy_substrate() {
   local installed
   installed="$(k get namespace ate-system -o jsonpath='{.metadata.annotations.substrate-commit}' 2> /dev/null || true)"
   if [[ "${FORCE_INSTALL_SUBSTRATE:-false}" != "true" && "${installed}" == "${SUBSTRATE_COMMIT}" ]] &&
-    k -n ate-system get deployment ate-api-server > /dev/null 2>&1; then
+    k -n ate-system get deployment ate-api-server > /dev/null 2>&1 &&
+    k -n ate-system get deployment k8s-credential-provider > /dev/null 2>&1; then
     log "Substrate ${SUBSTRATE_COMMIT:0:12} already installed; waiting for ate-api-server..."
     k -n ate-system wait --for=condition=Available deployment/ate-api-server --timeout=180s
     return
@@ -515,7 +516,7 @@ deploy_substrate() {
         go run ./cmd/ate-setup --kind --context="${KUBE_CONTEXT}" \
         deploy ate-system \
         --rollout-timeout="${SUBSTRATE_ROLLOUT_TIMEOUT:-5m}" \
-        --credential-provider='{"enabled":false}' \
+        --credential-provider='{"name":"k8s.io"}' \
         --ateapi-authz-bootstrap-owners="system:serviceaccount:ate-system:ate-client,system:serviceaccount:${AX_SYSTEM_NAMESPACE}:ax-server" \
         --ingress-allowed-spiffe-ids="spiffe://cluster.local/ns/${AX_SYSTEM_NAMESPACE}/sa/ax-server"
     )
@@ -525,7 +526,8 @@ deploy_substrate() {
 
   log "Building and installing Substrate ${SUBSTRATE_COMMIT:0:12} (this takes a while the first time)..."
   # Substrate's kind profile fits a single local node: in-cluster Postgres,
-  # RustFS for snapshots, no cloud credential provider. Its only kind-specific
+  # RustFS for snapshots, and, as in AX's kind setup, the Kubernetes Secrets
+  # credential provider that gateway egress rules read credentials from. Its only kind-specific
   # assumptions are the kind-registry name, which registry.yaml provides, and
   # a reachable Docker daemon, which builds the images anyway.
   # Substrate 1.0 dropped hack/install-ate-kind.sh for `ate-setup --kind`,
@@ -540,7 +542,7 @@ deploy_substrate() {
       KO_DEFAULTPLATFORMS="linux/${NODE_ARCH}" "${install_cmd[@]}" \
       deploy ate-system \
       --rollout-timeout="${SUBSTRATE_ROLLOUT_TIMEOUT:-5m}" \
-      --credential-provider='{"enabled":false}' \
+      --credential-provider='{"name":"k8s.io"}' \
       --ateapi-authz-bootstrap-owners="system:serviceaccount:ate-system:ate-client,system:serviceaccount:${AX_SYSTEM_NAMESPACE}:ax-server" \
       --ingress-allowed-spiffe-ids="spiffe://cluster.local/ns/${AX_SYSTEM_NAMESPACE}/sa/ax-server"
   )
@@ -645,6 +647,25 @@ deploy_control_plane() {
   k -n "${AX_SYSTEM_NAMESPACE}" rollout status deployment/ax-server --timeout=180s
 }
 
+# deploy_gateway_e2e sets up what AX's gateway egress scenario needs, as AX's
+# kind setup does: the credential provider's policy, an egress gateway that
+# trusts the echo server's CA, and the echo server.
+deploy_gateway_e2e() {
+  [[ -f "${AX_DIR}/test/e2e/manifests/echo.yaml" ]] || return 0
+  log "Setting up the credential provider, the egress gateway and the echo server..."
+  # The credential provider reads its policy only at startup.
+  render credential-policy.yaml | k apply -f -
+  k -n ate-system rollout restart deployment/k8s-credential-provider
+  k -n ate-system rollout status deployment/k8s-credential-provider --timeout=180s
+  if [[ -x "${SUBSTRATE_DIR}/hack/setup-e2e-egress-tls-kind.sh" ]]; then
+    (cd "${SUBSTRATE_DIR}" && KUBECTL_CONTEXT="${KUBE_CONTEXT}" ./hack/setup-e2e-egress-tls-kind.sh)
+  else
+    warn "this Substrate has no hack/setup-e2e-egress-tls-kind.sh; the egress gateway will not trust the echo server"
+  fi
+  render echo.yaml | k apply -f -
+  k -n "${AX_SYSTEM_NAMESPACE}" rollout status deployment/ax-echo --timeout=120s
+}
+
 write_env() {
   cat > "${ENV_FILE}" << EOF
 export KUBECONFIG="${KUBECONFIG}"
@@ -673,6 +694,7 @@ deploy() {
   deploy_workers
   build_images
   deploy_control_plane
+  deploy_gateway_e2e
   write_env
   log "AX is running on ${DISTRO} with ${SERVER}-server and the ${RUNNER} task-runner. Try:"
   cat >&2 << EOF

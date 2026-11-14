@@ -13,11 +13,13 @@ use tracing::warn;
 
 use crate::ateapi::control_client::ControlClient;
 use crate::ateapi::{
-    Actor, ActorState, ActorTemplate, Atespace, CreateActorRequest, CreateActorTemplateRequest,
-    CreateAtespaceRequest, DeleteActorRequest, DeleteActorTemplateRequest, GetActorRequest,
-    GetActorTemplateRequest, ListActorTemplatesRequest, ListActorsRequest, ListOptions, ObjectRef,
+    Actor, ActorState, ActorTemplate, Atespace, CreateActorEgressPolicyRequest, CreateActorRequest,
+    CreateActorTemplateRequest, CreateAtespaceRequest, CreateTagRequest, DeleteActorRequest,
+    DeleteActorTemplateRequest, DeleteTagRequest, EgressPolicy, EgressRule,
+    GetActorEgressPolicyRequest, GetActorRequest, GetActorTemplateRequest, GetTagRequest,
+    ListActorTemplatesRequest, ListActorsRequest, ListOptions, ListTagsRequest, ObjectRef,
     ResourceMetadata, ResourceRequirements, ResumeActorRequest, RevertActorRequest,
-    SuspendActorRequest,
+    SuspendActorRequest, Tag, TagScope,
 };
 use crate::tls::{self, Connector, TlsOptions};
 use crate::{Error, Result, RetryPolicy, build_actor_template};
@@ -153,6 +155,10 @@ fn state(actor: &Actor) -> ActorState {
 const UNAVAILABLE: &[Code] = &[Code::Unavailable];
 const ABORTED_OR_UNAVAILABLE: &[Code] = &[Code::Aborted, Code::Unavailable];
 
+/// The name Substrate requires for an actor's egress policy. An actor has at
+/// most one.
+const EGRESS_POLICY_NAME: &str = "default";
+
 impl Client {
     /// Sets up a client. It connects on first use, so this fails only on bad
     /// options, such as an unreadable CA file.
@@ -209,9 +215,11 @@ impl Client {
     }
 
     /// Calls `f` with a fresh request built from `req`, retrying `retryable`
-    /// codes under the client's policy.
+    /// codes under the client's policy. Each attempt is a client span named
+    /// after Substrate's `method`, under the caller's span.
     async fn call<Req, Resp, F, Fut>(
         &self,
+        method: &str,
         retryable: &[Code],
         req: Req,
         f: F,
@@ -221,9 +229,12 @@ impl Client {
         F: Fn(Control, Request<Req>) -> Fut,
         Fut: Future<Output = Result<Response<Resp>, Status>>,
     {
+        let name = format!("substrate.ateapi.v1.Control/{method}");
         self.retry
             .run(retryable, || {
-                f(self.control.clone(), Request::new(req.clone()))
+                rax_otelenv::rpc::client_call(&name, Request::new(req.clone()), |r| {
+                    f(self.control.clone(), r)
+                })
             })
             .await
             .map(Response::into_inner)
@@ -240,7 +251,7 @@ impl Client {
             }),
         };
         match self
-            .call(UNAVAILABLE, req, |mut c, r| async move {
+            .call("CreateAtespace", UNAVAILABLE, req, |mut c, r| async move {
                 c.create_atespace(r).await
             })
             .await
@@ -256,34 +267,37 @@ impl Client {
         let req = GetActorTemplateRequest {
             actor_template: objref(atespace, name),
         };
-        self.call(UNAVAILABLE, req, |mut c, r| async move {
-            c.get_actor_template(r).await
-        })
+        self.call(
+            "GetActorTemplate",
+            UNAVAILABLE,
+            req,
+            |mut c, r| async move { c.get_actor_template(r).await },
+        )
         .await
         .map_err(|e| Error::new(format!("getting actor template {atespace}/{name}"), e))
     }
 
-    /// Returns the template if it exists, and otherwise creates it from the
-    /// image, resource limits (`None` for the defaults) and environment.
-    pub async fn ensure_actor_template(
-        &self,
-        atespace: &str,
-        name: &str,
-        image: &str,
-        resources: Option<&ResourceRequirements>,
-        env: &BTreeMap<String, String>,
-    ) -> Result<ActorTemplate> {
-        if let Ok(existing) = self.get_actor_template(atespace, name).await {
-            return Ok(existing);
+    /// Returns the named template if it exists, and otherwise creates it from
+    /// `tmpl`. A concurrent create of the same template is not an error: the
+    /// winner's template is returned.
+    pub async fn ensure_template(&self, tmpl: ActorTemplate) -> Result<ActorTemplate> {
+        let meta = tmpl.metadata.clone().unwrap_or_default();
+        let (atespace, name) = (meta.atespace.as_str(), meta.name.as_str());
+        match self.get_actor_template(atespace, name).await {
+            Ok(existing) => return Ok(existing),
+            Err(e) if e.code() != Code::NotFound => return Err(e),
+            Err(_) => {}
         }
-        let tmpl = build_actor_template(atespace, name, image, env, &[], "", resources);
         let req = CreateActorTemplateRequest {
             actor_template: Some(tmpl),
         };
         match self
-            .call(UNAVAILABLE, req, |mut c, r| async move {
-                c.create_actor_template(r).await
-            })
+            .call(
+                "CreateActorTemplate",
+                UNAVAILABLE,
+                req,
+                |mut c, r| async move { c.create_actor_template(r).await },
+            )
             .await
         {
             Ok(created) => Ok(created),
@@ -297,6 +311,28 @@ impl Client {
         }
     }
 
+    /// Returns the template if it exists, and otherwise creates it from the
+    /// image, resource limits (`None` for the defaults) and environment.
+    pub async fn ensure_actor_template(
+        &self,
+        atespace: &str,
+        name: &str,
+        image: &str,
+        resources: Option<&ResourceRequirements>,
+        env: &BTreeMap<String, String>,
+    ) -> Result<ActorTemplate> {
+        self.ensure_template(build_actor_template(
+            atespace,
+            name,
+            image,
+            env,
+            &[],
+            "",
+            resources,
+        ))
+        .await
+    }
+
     /// Creates the actor from the template. An existing actor is returned as
     /// it is, unless it crashed, in which case it is reverted to its last
     /// snapshot (or, failing that, recreated), or it is being deleted, in
@@ -308,6 +344,21 @@ impl Client {
         template_atespace: &str,
         template: &str,
     ) -> Result<Actor> {
+        self.ensure_actor_from_tag(atespace, name, template_atespace, template, "")
+            .await
+    }
+
+    /// Like [`ensure_actor`](Self::ensure_actor), seeding a new actor from
+    /// the snapshot Tag `source_tag` (a workspace snapshot) when it is not
+    /// empty.
+    pub async fn ensure_actor_from_tag(
+        &self,
+        atespace: &str,
+        name: &str,
+        template_atespace: &str,
+        template: &str,
+        source_tag: &str,
+    ) -> Result<Actor> {
         let req = CreateActorRequest {
             actor: Some(Actor {
                 metadata: Some(ResourceMetadata {
@@ -316,13 +367,19 @@ impl Client {
                     ..Default::default()
                 }),
                 actor_template: objref(template_atespace, template),
+                source_tag: (!source_tag.is_empty())
+                    .then(|| objref(atespace, source_tag))
+                    .flatten(),
                 ..Default::default()
             }),
         };
         let create = || {
-            self.call(UNAVAILABLE, req.clone(), |mut c, r| async move {
-                c.create_actor(r).await
-            })
+            self.call(
+                "CreateActor",
+                UNAVAILABLE,
+                req.clone(),
+                |mut c, r| async move { c.create_actor(r).await },
+            )
         };
         let context = || format!("creating actor {atespace}/{name}");
         match create().await {
@@ -331,16 +388,27 @@ impl Client {
             Err(_) => {}
         }
 
-        let existing = self.get_actor(atespace, name).await?;
+        // The actor exists, as on every suspend and resume after the first.
+        let existing = match self.get_actor(atespace, name).await {
+            Ok(a) => a,
+            // An actor being deleted went away after the create.
+            Err(e) if e.code() == Code::NotFound => {
+                return create().await.map_err(|e| Error::new(context(), e));
+            }
+            Err(e) => return Err(e),
+        };
         match state(&existing) {
             ActorState::Crashed => {
                 let req = RevertActorRequest {
                     actor: objref(atespace, name),
                 };
                 match self
-                    .call(UNAVAILABLE, req, |mut c, r| async move {
-                        c.revert_actor(r).await
-                    })
+                    .call(
+                        "RevertActor",
+                        ABORTED_OR_UNAVAILABLE,
+                        req,
+                        |mut c, r| async move { c.revert_actor(r).await },
+                    )
                     .await
                 {
                     Ok(resp) => {
@@ -366,9 +434,8 @@ impl Client {
             ActorState::Deleting => {
                 for _ in 0..self.retry.deleting_wait_attempts {
                     tokio::time::sleep(self.retry.deleting_wait_interval).await;
-                    let mut c = self.control.clone();
-                    match c.create_actor(req.clone()).await {
-                        Ok(actor) => return Ok(actor.into_inner()),
+                    match create().await {
+                        Ok(actor) => return Ok(actor),
                         Err(e) if e.code() == Code::AlreadyExists => {}
                         Err(e) => return Err(Error::new(context(), e)),
                     }
@@ -390,9 +457,12 @@ impl Client {
             actor: objref(atespace, name),
         };
         let resp = self
-            .call(ABORTED_OR_UNAVAILABLE, req, |mut c, r| async move {
-                c.resume_actor(r).await
-            })
+            .call(
+                "ResumeActor",
+                ABORTED_OR_UNAVAILABLE,
+                req,
+                |mut c, r| async move { c.resume_actor(r).await },
+            )
             .await
             .map_err(|e| Error::new(format!("resuming actor {atespace}/{name}"), e))?;
         let actor = resp.actor.ok_or_else(|| {
@@ -413,9 +483,12 @@ impl Client {
             actor: objref(atespace, name),
             options: None,
         };
-        self.call(ABORTED_OR_UNAVAILABLE, req, |mut c, r| async move {
-            c.suspend_actor(r).await
-        })
+        self.call(
+            "SuspendActor",
+            ABORTED_OR_UNAVAILABLE,
+            req,
+            |mut c, r| async move { c.suspend_actor(r).await },
+        )
         .await
         .map(drop)
         .map_err(|e| Error::new(format!("suspending actor {atespace}/{name}"), e))
@@ -425,11 +498,9 @@ impl Client {
         let req = GetActorRequest {
             actor: objref(atespace, name),
         };
-        self.call(
-            UNAVAILABLE,
-            req,
-            |mut c, r| async move { c.get_actor(r).await },
-        )
+        self.call("GetActor", UNAVAILABLE, req, |mut c, r| async move {
+            c.get_actor(r).await
+        })
         .await
         .map_err(|e| Error::new(format!("getting actor {atespace}/{name}"), e))
     }
@@ -444,9 +515,12 @@ impl Client {
         };
         loop {
             let resp = self
-                .call(UNAVAILABLE, req.clone(), |mut c, r| async move {
-                    c.list_actors(r).await
-                })
+                .call(
+                    "ListActors",
+                    UNAVAILABLE,
+                    req.clone(),
+                    |mut c, r| async move { c.list_actors(r).await },
+                )
                 .await
                 .map_err(|e| Error::new(format!("listing actors in {atespace:?}"), e))?;
             actors.extend(resp.actors);
@@ -460,6 +534,67 @@ impl Client {
         }
     }
 
+    /// Fetches the actor's egress policy. The error has code NotFound when the
+    /// actor has none.
+    pub async fn get_actor_egress_policy(
+        &self,
+        atespace: &str,
+        actor: &str,
+    ) -> Result<EgressPolicy> {
+        let req = GetActorEgressPolicyRequest {
+            actor: objref(atespace, actor),
+            name: EGRESS_POLICY_NAME.to_owned(),
+        };
+        self.call(
+            "GetActorEgressPolicy",
+            UNAVAILABLE,
+            req,
+            |mut c, r| async move { c.get_actor_egress_policy(r).await },
+        )
+        .await
+        .map_err(|e| {
+            Error::new(
+                format!("getting egress policy of actor {atespace}/{actor}"),
+                e,
+            )
+        })
+    }
+
+    /// Creates the actor's egress policy with `rules` unless it has one.
+    pub async fn ensure_actor_egress_policy(
+        &self,
+        atespace: &str,
+        actor: &str,
+        rules: &[EgressRule],
+    ) -> Result<()> {
+        let req = CreateActorEgressPolicyRequest {
+            actor: objref(atespace, actor),
+            egress_policy: Some(EgressPolicy {
+                metadata: Some(ResourceMetadata {
+                    atespace: atespace.to_owned(),
+                    name: EGRESS_POLICY_NAME.to_owned(),
+                    ..Default::default()
+                }),
+                rules: rules.to_vec(),
+            }),
+        };
+        match self
+            .call(
+                "CreateActorEgressPolicy",
+                UNAVAILABLE,
+                req,
+                |mut c, r| async move { c.create_actor_egress_policy(r).await },
+            )
+            .await
+        {
+            Err(e) if e.code() != Code::AlreadyExists => Err(Error::new(
+                format!("creating egress policy of actor {atespace}/{actor}"),
+                e,
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// Deletes the actor and waits until it is gone. A missing actor is not
     /// an error.
     pub async fn delete_actor(&self, atespace: &str, name: &str) -> Result<()> {
@@ -468,9 +603,12 @@ impl Client {
             options: None,
         };
         match self
-            .call(ABORTED_OR_UNAVAILABLE, req, |mut c, r| async move {
-                c.delete_actor(r).await
-            })
+            .call(
+                "DeleteActor",
+                ABORTED_OR_UNAVAILABLE,
+                req,
+                |mut c, r| async move { c.delete_actor(r).await },
+            )
             .await
         {
             Err(e) if e.code() == Code::NotFound => return Ok(()),
@@ -479,12 +617,18 @@ impl Client {
         }
         let wait = async {
             loop {
-                let mut c = self.control.clone();
-                if let Err(e) = c
-                    .get_actor(GetActorRequest {
-                        actor: objref(atespace, name),
-                    })
-                    .await
+                let req = Request::new(GetActorRequest {
+                    actor: objref(atespace, name),
+                });
+                let get = rax_otelenv::rpc::client_call(
+                    "substrate.ateapi.v1.Control/GetActor",
+                    req,
+                    |r| {
+                        let mut c = self.control.clone();
+                        async move { c.get_actor(r).await }
+                    },
+                );
+                if let Err(e) = get.await
                     && e.code() == Code::NotFound
                 {
                     return;
@@ -509,9 +653,12 @@ impl Client {
             options: None,
         };
         let resp = self
-            .call(UNAVAILABLE, req, |mut c, r| async move {
-                c.list_actor_templates(r).await
-            })
+            .call(
+                "ListActorTemplates",
+                UNAVAILABLE,
+                req,
+                |mut c, r| async move { c.list_actor_templates(r).await },
+            )
             .await
             .map_err(|e| Error::new(format!("listing actor templates in {atespace}"), e))?;
         if !resp.next_page_token.is_empty() {
@@ -527,15 +674,112 @@ impl Client {
             options: None,
         };
         match self
-            .call(ABORTED_OR_UNAVAILABLE, req, |mut c, r| async move {
-                c.delete_actor_template(r).await
-            })
+            .call(
+                "DeleteActorTemplate",
+                ABORTED_OR_UNAVAILABLE,
+                req,
+                |mut c, r| async move { c.delete_actor_template(r).await },
+            )
             .await
         {
             Err(e) if e.code() != Code::NotFound => Err(Error::new(
                 format!("deleting actor template {atespace}/{name}"),
                 e,
             )),
+            _ => Ok(()),
+        }
+    }
+
+    // Snapshot tags.
+
+    /// Creates an atespace-scoped Tag capturing the snapshot of the suspended
+    /// actor `source_actor`. A tag left by an earlier incomplete attempt
+    /// should be deleted before retrying.
+    pub async fn create_tag(&self, atespace: &str, name: &str, source_actor: &str) -> Result<Tag> {
+        let req = CreateTagRequest {
+            tag: Some(Tag {
+                metadata: Some(ResourceMetadata {
+                    atespace: atespace.to_owned(),
+                    name: name.to_owned(),
+                    ..Default::default()
+                }),
+                scope: TagScope::Atespace as i32,
+                source_actor: objref(atespace, source_actor),
+                ..Default::default()
+            }),
+        };
+        self.call(
+            "CreateTag",
+            ABORTED_OR_UNAVAILABLE,
+            req,
+            |mut c, r| async move { c.create_tag(r).await },
+        )
+        .await
+        .map_err(|e| {
+            Error::new(
+                format!("creating tag {atespace}/{name} from actor {source_actor}"),
+                e,
+            )
+        })
+    }
+
+    pub async fn get_tag(&self, atespace: &str, name: &str) -> Result<Tag> {
+        let req = GetTagRequest {
+            tag: objref(atespace, name),
+        };
+        self.call("GetTag", UNAVAILABLE, req, |mut c, r| async move {
+            c.get_tag(r).await
+        })
+        .await
+        .map_err(|e| Error::new(format!("getting tag {atespace}/{name}"), e))
+    }
+
+    /// Lists every Tag in the atespace, or in all atespaces when it is empty.
+    pub async fn list_tags(&self, atespace: &str) -> Result<Vec<Tag>> {
+        let mut tags = Vec::new();
+        let mut req = ListTagsRequest {
+            atespace: atespace.to_owned(),
+            options: Some(ListOptions::default()),
+        };
+        loop {
+            let resp = self
+                .call(
+                    "ListTags",
+                    UNAVAILABLE,
+                    req.clone(),
+                    |mut c, r| async move { c.list_tags(r).await },
+                )
+                .await
+                .map_err(|e| Error::new(format!("listing tags in {atespace:?}"), e))?;
+            tags.extend(resp.tags);
+            if resp.next_page_token.is_empty() {
+                return Ok(tags);
+            }
+            req.options = Some(ListOptions {
+                page_token: resp.next_page_token,
+                ..Default::default()
+            });
+        }
+    }
+
+    /// Deletes a Tag and the snapshot it owns. A missing Tag is not an error.
+    pub async fn delete_tag(&self, atespace: &str, name: &str) -> Result<()> {
+        let req = DeleteTagRequest {
+            tag: objref(atespace, name),
+            options: None,
+        };
+        match self
+            .call(
+                "DeleteTag",
+                ABORTED_OR_UNAVAILABLE,
+                req,
+                |mut c, r| async move { c.delete_tag(r).await },
+            )
+            .await
+        {
+            Err(e) if e.code() != Code::NotFound => {
+                Err(Error::new(format!("deleting tag {atespace}/{name}"), e))
+            }
             _ => Ok(()),
         }
     }

@@ -156,7 +156,7 @@ async fn apply_atespace() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn apply_configured_and_empty_documents() {
+async fn apply_immutable_and_empty_documents() {
     const FIRST: &str =
         "apiVersion: ax.io/v1alpha1\nkind: Workspace\nmetadata:\n  name: first\nspec: {}\n";
     let second = FIRST.replace("name: first", "name: second");
@@ -242,7 +242,7 @@ async fn apply_configured_and_empty_documents() {
         assert_eq!(out, want_out, "{name}");
     }
 
-    // A changed spec is reported as configured.
+    // Workspaces are immutable: a changed spec is refused.
     let env = serve(Arc::new(MemoryStore::new())).await;
     let path = write(env.home.path(), FIRST);
     assert_eq!(
@@ -251,12 +251,11 @@ async fn apply_configured_and_empty_documents() {
     );
     let changed = write(
         env.home.path(),
-        &FIRST.replace("spec: {}", "spec:\n  skills:\n    path: /s"),
+        &FIRST.replace("spec: {}", "spec:\n  setup:\n    skills:\n      path: /s"),
     );
-    assert_eq!(
-        rax(&env, &["apply", "-f", &changed]).1,
-        "workspace.ax.io/first configured\n"
-    );
+    let (code, out, err) = rax(&env, &["apply", "-f", &changed]);
+    assert_eq!((code, out.as_str()), (1, ""));
+    assert!(err.contains("already exists and is immutable"), "{err}");
     let (code, _, err) = rax(&env, &["apply"]);
     assert_eq!(code, 1);
     assert!(err.contains("missing required flag: -f <file>"), "{err}");
@@ -351,15 +350,16 @@ kind: Workspace
 metadata:
   name: ws
 spec:
-  git:
-  - name: origin
-    repo: https://example.com/r.git
+  setup:
+    git:
+    - name: origin
+      repo: https://example.com/r.git
+    skills:
+      path: /workspace/.agents/skills
   mcp:
     servers:
     - name: local-mcp
       endpoint: http://localhost:9000
-  skills:
-    path: /workspace/.agents/skills
 ---
 apiVersion: ax.io/v1alpha1
 kind: Gateway
@@ -392,8 +392,9 @@ kind: Task
 metadata:
   name: t
 spec:
-  image: img
-  command: [sh, -c, "true"]
+  profile:
+    image: img
+  commands: [sh, -c, "true"]
   workspace:
     name: ws
   config:
@@ -411,7 +412,7 @@ spec:
     let (_, out, _) = rax(&env, &["describe", "workspace", "ws"]);
     assert_eq!(
         out,
-        "Name:         ws\nAtespace:     default\nGit Repositories:\n  - origin (https://example.com/r.git, branch: main)\nMCP Servers:\n  - local-mcp: http://localhost:9000\nSkills Path:      /workspace/.agents/skills\n"
+        "Name:         ws\nAtespace:     default\nGit Repositories:\n  - origin (https://example.com/r.git, ref: main)\nSkills Path:  /workspace/.agents/skills\nMCP Servers:\n  - local-mcp: http://localhost:9000\n"
     );
     let (_, out, _) = rax(&env, &["describe", "gateway", "gw"]);
     assert_eq!(
@@ -427,11 +428,11 @@ spec:
     );
     let (_, out, _) = rax(&env, &["describe", "task", "t"]);
     assert!(
-        out.starts_with("Name:         t\nAtespace:     default\nPhase:        "),
+        out.starts_with("Name:         t\nAtespace:     default\nUID:          "),
         "{out}"
     );
     assert!(
-        out.contains("Workspace:    ws  path=/workspace\nImage:        img\nCommand:      [sh -c true]\nConfig:\n  a:\n    x: y\n  b: 1\n"),
+        out.contains("Workspace:    ws  path=/workspace\nImage:        img\nCommands:     [sh -c true]\nConfig:\n  a:\n    x: y\n  b: 1\n"),
         "{out}"
     );
 

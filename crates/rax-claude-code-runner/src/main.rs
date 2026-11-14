@@ -2,7 +2,7 @@
 //! runner of the Claude Code image (`Dockerfile.claude-code`), installed
 //! there as `/usr/local/bin/ax-task-runner`.
 //!
-//! A Task that leaves `spec.command` empty runs one headless `claude --print`
+//! A Task that leaves `spec.commands` empty runs one headless `claude --print`
 //! session built from `spec.config` (see [`rax_claude_code_runner`]); a Task
 //! that sets it runs as under `rax-task-runner`. Flags and environment are
 //! the same as `rax-task-runner`'s.
@@ -55,6 +55,7 @@ fn fatal(err: impl std::fmt::Display) -> ! {
 
 #[tokio::main]
 async fn main() {
+    runner::answer_git_askpass();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

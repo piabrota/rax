@@ -7,12 +7,14 @@
 //! actor template's `AX_TASK_YAML` and `AX_WORKSPACE_YAML`, suspending or
 //! deleting it stops the runner. Every step goes through the CLI binary, as
 //! the real suite does, and `ssh` reaches the runner's guest services
-//! directly at its worker IP.
+//! through a stand-in for Substrate's atenet router, which routes each call
+//! by its `ate-target-actor` header to the actor's runner.
 //!
 //! Differences from a cluster: workspaces live in a temp dir, so tasks that
 //! bind none get one there instead of `/workspace`; suspend keeps the files
 //! on disk but not processes, as VOLUMES snapshots do, though the rootfs
-//! (`/tmp`) is the host's and is not reset; there is no atenet router.
+//! (`/tmp`) is the host's and is not reset; there is no egress gateway, so
+//! a Gateway's rules reach the actor's egress policy but are not enforced.
 //!
 //! Two environment variables point the suite at other binaries, to check
 //! that RAX and AX interoperate:
@@ -148,7 +150,7 @@ impl Lifecycle for LocalRunners {
                     task: Some(task),
                     workspace,
                     ax_dir: Some(ax_dir),
-                    on_command_exit: None,
+                    ..Default::default()
                 };
                 self.rt.spawn(rax_task_runner::runner::run(cfg, async {
                     let _ = stopped.await;
@@ -184,6 +186,48 @@ impl Lifecycle for LocalRunners {
     }
 }
 
+/// Serves a stand-in for Substrate's atenet router: each call goes to the
+/// runner of the actor its `ate-target-actor` header names. Returns its
+/// address.
+async fn serve_router(runners: Arc<LocalRunners>) -> String {
+    use tower::ServiceExt as _;
+    let route = move |req: axum::extract::Request| {
+        let runners = runners.clone();
+        async move {
+            let actor = req
+                .headers()
+                .get("ate-target-actor")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            let addr = runners
+                .running
+                .lock()
+                .unwrap()
+                .get(&actor)
+                .map(|(addr, _)| addr.clone());
+            let Some(addr) = addr else {
+                return tonic::Status::unavailable(format!("no running actor {actor:?}"))
+                    .into_http::<axum::body::Body>();
+            };
+            let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+                .unwrap()
+                .connect_lazy();
+            let (parts, body) = req.into_parts();
+            let req = http::Request::from_parts(parts, tonic::body::Body::new(body));
+            match channel.oneshot(req).await {
+                Ok(resp) => resp.map(axum::body::Body::new),
+                Err(e) => tonic::Status::unavailable(e.to_string()).into_http(),
+            }
+        }
+    };
+    let lis = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = lis.local_addr().unwrap().to_string();
+    let app = axum::Router::new().fallback(route);
+    tokio::spawn(async move { axum::serve(lis, app).await.unwrap() });
+    addr
+}
+
 /// A server process, stopped when dropped.
 struct ServerProcess(std::process::Child);
 
@@ -196,6 +240,7 @@ impl Drop for ServerProcess {
 
 struct Stack {
     server: String,
+    router: String,
     _external: Option<ServerProcess>,
     substrate: FakeSubstrate,
     runners: Arc<LocalRunners>,
@@ -273,6 +318,7 @@ async fn stack() -> Stack {
     };
     Stack {
         server,
+        router: serve_router(runners.clone()).await,
         _external: external,
         substrate,
         runners,
@@ -294,6 +340,7 @@ impl Stack {
         }
         cmd.args(args)
             .env("AX_HOME", self.home.path())
+            .env("ATENET_ROUTER_ADDR", &self.router)
             .env_remove("AX_SERVER")
             .stdin(std::process::Stdio::null());
         let out = tokio::task::spawn_blocking(move || cmd.output().unwrap())
@@ -358,8 +405,8 @@ fn condition(t: &Task, kind: &str) -> (String, String) {
         .unwrap_or_default()
 }
 
-fn phase(t: &Task) -> &str {
-    t.status.as_ref().map_or("", |s| s.phase.as_str())
+fn state(t: &Task) -> &'static str {
+    rax_api::format_task_state(t)
 }
 
 fn http_get(addr: &str, path: &str) -> (u16, String) {
@@ -415,7 +462,7 @@ async fn workspace_gateway_and_model_crud() {
     let repo = sample_repo(s.root.path());
     let ws = |env: &str| {
         format!(
-            "apiVersion: ax.io/v1alpha1\nkind: Workspace\nmetadata:\n  name: ws-crud\n  atespace: default\nspec:\n  git:\n  - name: origin\n    repo: {repo}\n    branch: v1.0.0\n  files:\n  - path: config/settings.json\n    content: '{{\"env\":\"{env}\"}}'\n  mcp:\n    servers:\n    - name: local-mcp\n      endpoint: http://localhost:9000\n  skills:\n    path: /workspace/.agents/skills\n"
+            "apiVersion: ax.io/v1alpha1\nkind: Workspace\nmetadata:\n  name: ws-crud\n  atespace: default\nspec:\n  setup:\n    git:\n    - name: origin\n      repo: {repo}\n      ref: v1.0.0\n    files:\n    - path: config/settings.json\n      content: '{{\"env\":\"{env}\"}}'\n    skills:\n      path: /workspace/.agents/skills\n  mcp:\n    servers:\n    - name: local-mcp\n      endpoint: http://localhost:9000\n"
         )
     };
     let r = "workspace.ax.io/ws-crud";
@@ -429,11 +476,14 @@ async fn workspace_gateway_and_model_crud() {
         &s.apply("default", &ws("e2e-v1")).await,
         &[&format!("{r} unchanged")],
     );
-    assert_contains(
-        "modified",
-        &s.apply("default", &ws("e2e-v2")).await,
-        &[&format!("{r} configured")],
-    );
+    // Workspaces are immutable.
+    let path = s.root.path().join("ws-v2.yaml");
+    std::fs::write(&path, ws("e2e-v2")).unwrap();
+    let (ok, _, out) = s
+        .run("default", &["apply", "-f", path.to_str().unwrap()])
+        .await;
+    assert!(!ok, "{out}");
+    assert_contains("modified", &out, &["already exists and is immutable"]);
     assert_contains(
         "get workspaces",
         &s.must("default", &["get", "workspaces"]).await,
@@ -442,13 +492,13 @@ async fn workspace_gateway_and_model_crud() {
     assert_contains(
         "get workspace",
         &s.must("default", &["get", "workspace", "ws-crud"]).await,
-        &["e2e-v2", "local-mcp", "config/settings.json"],
+        &["e2e-v1", "local-mcp", "config/settings.json"],
     );
     assert_contains(
         "describe workspace",
         &s.must("default", &["describe", "workspace", "ws-crud"])
             .await,
-        &["local-mcp", ".agents/skills"],
+        &["local-mcp", ".agents/skills", "v1.0.0"],
     );
     assert_contains(
         "delete",
@@ -560,8 +610,22 @@ async fn task_lifecycle_and_substrate_sync() {
         &[&format!("task.ax.io/{name} created")],
     );
     let t = s.task("default", name).await;
-    assert_eq!(phase(&t), "Suspended");
+    assert_eq!(state(&t), "Suspended");
     assert_eq!(t.status.as_ref().unwrap().actor, name);
+    // It records the UID of the Substrate actor, which describe shows.
+    let actor_uid = s.substrate.state().actors[&format!("default/{name}")]
+        .metadata
+        .as_ref()
+        .unwrap()
+        .uid
+        .clone();
+    assert!(!actor_uid.is_empty());
+    assert_eq!(t.status.as_ref().unwrap().actor_uid, actor_uid);
+    assert_contains(
+        "describe task",
+        &s.must("default", &["describe", "task", name]).await,
+        &[&format!("Actor UID:    {actor_uid}\n")],
+    );
 
     // Tasks are immutable.
     let path = s.root.path().join("dup.yaml");
@@ -611,14 +675,14 @@ async fn task_lifecycle_and_substrate_sync() {
         tmpl_name
     };
 
-    // Resuming makes it Running and Ready on the worker Substrate reports.
+    // Resuming makes it Working and Ready on the worker Substrate reports.
     assert_contains(
         "resume",
         &s.must("default", &["resume", "task", name]).await,
         &["resumed"],
     );
     let t = s.task("default", name).await;
-    assert_eq!(phase(&t), "Running");
+    assert_eq!(state(&t), "Working");
     assert_eq!(
         condition(&t, "WorkspaceReady"),
         ("True".into(), "SetupComplete".into())
@@ -627,10 +691,7 @@ async fn task_lifecycle_and_substrate_sync() {
         condition(&t, "Ready"),
         ("True".into(), "TaskRunning".into())
     );
-    assert_eq!(
-        t.status.as_ref().unwrap().worker_ip,
-        s.worker("default", name)
-    );
+    assert!(!s.worker("default", name).is_empty());
 
     // Deleting removes the task, the actor and its template.
     assert_contains(
@@ -650,7 +711,7 @@ async fn metadata_server_and_guest_exec() {
     let s = stack().await;
     let ws_path = s.root.path().join("meta-ws");
     let manifest = format!(
-        "apiVersion: ax.io/v1alpha1\nkind: Workspace\nmetadata:\n  name: ws-meta\n  atespace: default\nspec:\n  files:\n  - path: hello.txt\n    content: \"hello from workspace\"\n---\napiVersion: ax.io/v1alpha1\nkind: Task\nmetadata:\n  name: task-meta\n  atespace: default\nspec:\n  debug: true\n  workspace:\n    name: ws-meta\n    path: {ws}\n  env:\n  - name: CUSTOM_E2E_VAR\n    value: \"custom-val-123\"\n  command:\n  - sh\n  - -c\n  - \"echo cmd-ran-ok > {ws}/cmd-ran.txt\"\n",
+        "apiVersion: ax.io/v1alpha1\nkind: Workspace\nmetadata:\n  name: ws-meta\n  atespace: default\nspec:\n  setup:\n    files:\n    - path: hello.txt\n      content: \"hello from workspace\"\n---\napiVersion: ax.io/v1alpha1\nkind: Task\nmetadata:\n  name: task-meta\n  atespace: default\nspec:\n  debug: true\n  workspace:\n    name: ws-meta\n    path: {ws}\n  env:\n  - name: CUSTOM_E2E_VAR\n    value: \"custom-val-123\"\n  commands:\n  - sh\n  - -c\n  - \"echo cmd-ran-ok > {ws}/cmd-ran.txt\"\n",
         ws = ws_path.display()
     );
     s.apply("default", &manifest).await;
@@ -682,7 +743,7 @@ async fn metadata_server_and_guest_exec() {
         .unwrap()
         .to_owned();
 
-    // spec.command runs after setup.
+    // spec.commands runs after setup.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let (ok, _, out) = s
@@ -700,7 +761,10 @@ async fn metadata_server_and_guest_exec() {
         if ok && out.trim() == "cmd-ran-ok" {
             break;
         }
-        assert!(Instant::now() < deadline, "spec.command did not run: {out}");
+        assert!(
+            Instant::now() < deadline,
+            "spec.commands did not run: {out}"
+        );
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
@@ -753,7 +817,7 @@ async fn workspace_setup_files_and_git() {
     let repo = sample_repo(s.root.path());
     let primary = s.root.path().join("workspace/primary");
     let manifest = format!(
-        "apiVersion: ax.io/v1alpha1\nkind: Workspace\nmetadata:\n  name: ws-git\n  atespace: default\nspec:\n  git:\n  - name: sample\n    dir: \".\"\n    repo: {repo}\n    branch: v1.0.0\n  files:\n  - path: overlay/config.yaml\n    content: \"mode: git-plus-overlay\"\n  skills:\n    path: {p}/.agents/skills\n---\napiVersion: ax.io/v1alpha1\nkind: Task\nmetadata:\n  name: task-ws\n  atespace: default\nspec:\n  debug: true\n  workspace:\n    name: ws-git\n    path: {p}\n",
+        "apiVersion: ax.io/v1alpha1\nkind: Workspace\nmetadata:\n  name: ws-git\n  atespace: default\nspec:\n  setup:\n    git:\n    - name: sample\n      dir: \".\"\n      repo: {repo}\n      ref: v1.0.0\n    files:\n    - path: overlay/config.yaml\n      content: \"mode: git-plus-overlay\"\n    skills:\n      path: {p}/.agents/skills\n    commands:\n    - \"echo setup-cmd-ok > setup-cmd.txt\"\n---\napiVersion: ax.io/v1alpha1\nkind: Task\nmetadata:\n  name: task-ws\n  atespace: default\nspec:\n  debug: true\n  workspace:\n    name: ws-git\n    path: {p}\n",
         p = primary.display()
     );
     s.apply("default", &manifest).await;
@@ -763,7 +827,7 @@ async fn workspace_setup_files_and_git() {
             "default",
             "task-ws",
             &format!(
-                "set -e\npwd\ncat {p}/app.py\ncat {p}/overlay/config.yaml\ntest -d {p}/.agents/skills && echo SKILLS_DIR_OK\ntest -f {p}/.git/.ax/initialized && echo MARKERS_OK\n",
+                "set -e\npwd\ncat {p}/app.py\ncat {p}/overlay/config.yaml\ncat {p}/setup-cmd.txt\ntest -d {p}/.agents/skills && echo SKILLS_DIR_OK\ntest -f {p}/.git/.ax/initialized && echo MARKERS_OK\n",
                 p = primary.display()
             ),
         )
@@ -775,6 +839,7 @@ async fn workspace_setup_files_and_git() {
             &primary.display().to_string(),
             "hello from git repo v1",
             "mode: git-plus-overlay",
+            "setup-cmd-ok",
             "SKILLS_DIR_OK",
             "MARKERS_OK",
         ],
@@ -786,7 +851,7 @@ async fn task_suspend_and_resume_persistence() {
     let s = stack().await;
     let ws = s.root.path().join("persist-ws");
     let manifest = format!(
-        "apiVersion: ax.io/v1alpha1\nkind: Workspace\nmetadata:\n  name: ws-persist\n  atespace: default\nspec:\n  files:\n  - path: seed.txt\n    content: \"initial-seed\"\n---\napiVersion: ax.io/v1alpha1\nkind: Task\nmetadata:\n  name: task-persist\n  atespace: default\nspec:\n  debug: true\n  workspace:\n    name: ws-persist\n    path: {}\n",
+        "apiVersion: ax.io/v1alpha1\nkind: Workspace\nmetadata:\n  name: ws-persist\n  atespace: default\nspec:\n  setup:\n    files:\n    - path: seed.txt\n      content: \"initial-seed\"\n---\napiVersion: ax.io/v1alpha1\nkind: Task\nmetadata:\n  name: task-persist\n  atespace: default\nspec:\n  debug: true\n  workspace:\n    name: ws-persist\n    path: {}\n",
         ws.display()
     );
     s.apply("default", &manifest).await;
@@ -805,9 +870,8 @@ async fn task_suspend_and_resume_persistence() {
         &["suspended"],
     );
     let t = s.task("default", "task-persist").await;
-    assert_eq!(phase(&t), "Suspended");
+    assert_eq!(state(&t), "Suspended");
     assert_eq!(condition(&t, "Ready"), ("False".into(), "Suspended".into()));
-    assert_eq!(t.status.as_ref().unwrap().worker_ip, "");
     assert_eq!(
         s.substrate.state().actors["default/task-persist"]
             .status
@@ -863,9 +927,69 @@ async fn describe_and_atespace_isolation() {
         &[
             "task-describe",
             ns,
-            "Running",
+            "Working",
             "WorkspaceReady",
             "TaskRunning",
         ],
     );
+}
+
+/// AX's gateway egress scenario, as far as it goes without an egress
+/// gateway: a task bound to a Gateway gets the Gateway's rules as its
+/// actor's egress policy, and editing or deleting the Gateway does not
+/// change a task that already runs with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_egress_policy() {
+    let s = stack().await;
+    let gateway = |host: &str| {
+        format!(
+            "apiVersion: ax.io/v1alpha1\nkind: Gateway\nmetadata:\n  name: gw-egress\n  atespace: default\nspec:\n  egress:\n  - https:\n      hostnames:\n      - {host}\n"
+        )
+    };
+    s.apply(
+        "default",
+        &format!(
+            "{}---\napiVersion: ax.io/v1alpha1\nkind: Task\nmetadata:\n  name: task-egress\n  atespace: default\nspec:\n  debug: true\n  gateway:\n    name: gw-egress\n",
+            gateway("echo.example.com")
+        ),
+    )
+    .await;
+    s.apply("default", &task_manifest("default", "task-noegress", true))
+        .await;
+    s.must("default", &["resume", "task", "task-egress"]).await;
+    s.must("default", &["resume", "task", "task-noegress"])
+        .await;
+
+    let hosts = |actor: &str| -> Option<Vec<String>> {
+        let st = s.substrate.state();
+        let policy = st.egress_policies.get(&format!("default/{actor}"))?;
+        Some(
+            policy
+                .rules
+                .iter()
+                .flat_map(|r| r.https.iter().flat_map(|h| h.hostnames.clone()))
+                .collect(),
+        )
+    };
+    let want = Some(vec!["echo.example.com".to_owned()]);
+    assert_eq!(hosts("task-egress"), want);
+    assert_eq!(hosts("task-noegress"), None);
+    // The runner points git at its placeholder credential helper.
+    assert_contains(
+        "git askpass",
+        &s.ssh("default", "task-egress", "basename \"$GIT_ASKPASS\"")
+            .await,
+        &["git-askpass"],
+    );
+
+    s.apply("default", &gateway("other.example.com")).await;
+    for change in ["edited", "deleted"] {
+        if change == "deleted" {
+            s.must("default", &["delete", "gateway", "gw-egress"]).await;
+        }
+        s.must("default", &["suspend", "task", "task-egress"]).await;
+        s.must("default", &["resume", "task", "task-egress"]).await;
+        assert_eq!(hosts("task-egress"), want, "after the gateway was {change}");
+        assert_eq!(state(&s.task("default", "task-egress").await), "Working");
+    }
 }

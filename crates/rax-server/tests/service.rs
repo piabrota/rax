@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rax_api::v1alpha1::{self as api, *};
-use rax_api::{phase, reason};
+use rax_api::{format_task_state, reason};
 use rax_server::{Actor, ActorState, Actors, AxService, Reconciler, ServerOptions, router};
 use rax_store::{MemoryStore, ResourceStore, StoreError, TaskStore};
 use tonic::{Code, Status};
@@ -25,7 +25,10 @@ fn new_task(name: &str, image: &str) -> api::CreateTaskRequest {
         task: Some(Task {
             metadata: meta(name),
             spec: Some(TaskSpec {
-                image: image.into(),
+                profile: Some(Profile {
+                    image: image.into(),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -40,8 +43,8 @@ fn get(name: &str) -> api::GetTaskRequest {
     }
 }
 
-fn phase_of(t: &Task) -> &str {
-    t.status.as_ref().map_or("", |s| s.phase.as_str())
+fn state_of(t: &Task) -> &'static str {
+    format_task_state(t)
 }
 
 fn service(store: Arc<MemoryStore>, opts: ServerOptions) -> AxService {
@@ -71,6 +74,8 @@ struct FakeState {
     actors: HashMap<String, ActorState>,
     /// The workspace the last suspend or resume was given.
     workspace: Option<Workspace>,
+    /// The gateway the last suspend or resume was given.
+    gateway: Option<Gateway>,
 }
 
 impl FakeReconciler {
@@ -111,6 +116,7 @@ impl FakeReconciler {
     fn actor(name: &str, state: ActorState) -> Actor {
         Actor {
             name: name.into(),
+            uid: format!("uid-{name}"),
             state,
             worker_ip: if state == ActorState::Running {
                 "10.244.1.42".into()
@@ -124,17 +130,32 @@ impl FakeReconciler {
 
 #[async_trait]
 impl Reconciler for FakeReconciler {
-    async fn suspend(&self, task: &mut Task, ws: Option<Workspace>) -> Result<(), Status> {
-        self.state.lock().unwrap().workspace = ws;
+    async fn suspend(
+        &self,
+        task: &mut Task,
+        ws: Option<Workspace>,
+        gw: Option<Gateway>,
+    ) -> Result<(), Status> {
+        let mut s = self.state.lock().unwrap();
+        (s.workspace, s.gateway) = (ws, gw);
+        drop(s);
         self.drive(task, ActorState::Suspended)
     }
 
-    async fn resume(&self, task: &mut Task, ws: Option<Workspace>) -> Result<(), Status> {
-        self.state.lock().unwrap().workspace = ws;
+    async fn resume(
+        &self,
+        task: &mut Task,
+        ws: Option<Workspace>,
+        gw: Option<Gateway>,
+    ) -> Result<(), Status> {
+        let mut s = self.state.lock().unwrap();
+        (s.workspace, s.gateway) = (ws, gw);
+        drop(s);
         self.drive(task, ActorState::Running)
     }
 
-    async fn delete(&self, _atespace: &str, name: &str) -> Result<(), Status> {
+    async fn delete(&self, task: &Task) -> Result<(), Status> {
+        let name = task.metadata.as_ref().map_or("", |m| m.name.as_str());
         let (hook, err) = {
             let mut s = self.state.lock().unwrap();
             s.deletes += 1;
@@ -190,6 +211,7 @@ impl FakeActors {
     fn actor(&self, name: &str) -> Actor {
         Actor {
             name: name.into(),
+            uid: format!("uid-{name}"),
             state: *self.state.lock().unwrap(),
             worker_ip: self.worker_ip.clone(),
             crash_message: String::new(),
@@ -218,7 +240,7 @@ impl Actors for FakeActors {
 fn assert_no_actor_state(stored: &Task) {
     let st = stored.status.as_ref().unwrap();
     assert!(
-        st.phase.is_empty() && st.actor.is_empty() && st.worker_ip.is_empty(),
+        st.state() == TaskState::Unspecified && st.actor.is_empty() && st.actor_uid.is_empty(),
         "stored status {st:?}"
     );
     assert!(
@@ -238,7 +260,7 @@ async fn grpc_round_trip() {
         .unwrap();
 
     // Metadata is left partially empty to exercise server-side defaulting.
-    c.update_workspace(UpdateWorkspaceRequest {
+    c.create_workspace(CreateWorkspaceRequest {
         workspace: Some(Workspace {
             metadata: meta("grpc-ws"),
             spec: Some(Default::default()),
@@ -297,7 +319,10 @@ async fn grpc_round_trip() {
     );
 
     // Tasks are immutable.
-    task.spec.as_mut().unwrap().image = "ghcr.io/test/updated-image".into();
+    task.spec.as_mut().unwrap().profile = Some(Profile {
+        image: "ghcr.io/test/updated-image".into(),
+        ..Default::default()
+    });
     let err = c
         .create_task(CreateTaskRequest { task: Some(task) })
         .await
@@ -311,7 +336,7 @@ async fn grpc_round_trip() {
         })
         .await
         .unwrap();
-    assert_eq!(phase_of(t.get_ref()), "Suspended");
+    assert_eq!(state_of(t.get_ref()), "Suspended");
     let t = c
         .resume_task(ResumeTaskRequest {
             atespace: "default".into(),
@@ -319,11 +344,12 @@ async fn grpc_round_trip() {
         })
         .await
         .unwrap();
-    assert_eq!(phase_of(t.get_ref()), "Running");
+    assert_eq!(state_of(t.get_ref()), "Working");
 
     let wss = c
         .list_workspaces(ListWorkspacesRequest {
             atespace: "default".into(),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -412,7 +438,7 @@ async fn rejects_invalid_names() {
             ..Default::default()
         };
         let err = svc
-            .update_workspace(UpdateWorkspaceRequest {
+            .create_workspace(CreateWorkspaceRequest {
                 workspace: Some(ws),
             })
             .await
@@ -450,7 +476,7 @@ async fn rejects_invalid_names() {
     })
     .await
     .unwrap();
-    svc.update_workspace(UpdateWorkspaceRequest {
+    svc.create_workspace(CreateWorkspaceRequest {
         workspace: Some(Workspace {
             metadata: meta("ws-1"),
             ..Default::default()
@@ -497,7 +523,7 @@ async fn validates_workspace_binding() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::InvalidArgument);
-    svc.update_workspace(UpdateWorkspaceRequest {
+    svc.create_workspace(CreateWorkspaceRequest {
         workspace: Some(Workspace {
             metadata: meta("a"),
             ..Default::default()
@@ -526,7 +552,7 @@ async fn reconciler_lifecycle() {
         .await
         .unwrap();
     assert_eq!(rec.counts(), (1, 0));
-    assert_eq!(phase_of(&t), "Suspended");
+    assert_eq!(state_of(&t), "Suspended");
 
     let t = svc
         .resume_task(ResumeTaskRequest {
@@ -536,7 +562,7 @@ async fn reconciler_lifecycle() {
         .await
         .unwrap();
     assert_eq!(rec.counts(), (2, 0));
-    assert_eq!(phase_of(&t), "Running");
+    assert_eq!(state_of(&t), "Working");
 
     let t = svc
         .suspend_task(SuspendTaskRequest {
@@ -546,7 +572,7 @@ async fn reconciler_lifecycle() {
         .await
         .unwrap();
     assert_eq!(rec.counts(), (3, 0));
-    assert_eq!(phase_of(&t), "Suspended");
+    assert_eq!(state_of(&t), "Suspended");
 
     svc.delete_task(DeleteTaskRequest {
         name: "task-rec".into(),
@@ -575,7 +601,7 @@ async fn delete_marks_terminating_while_cleaning_up() {
                     tokio::runtime::Handle::current()
                         .block_on(store.get_task("default", "task-term"))
                 });
-                *observed.lock().unwrap() = t.map(|t| phase_of(&t).to_owned()).unwrap_or_default();
+                *observed.lock().unwrap() = t.map(|t| state_of(&t).to_owned()).unwrap_or_default();
             }))
         });
     }
@@ -589,7 +615,7 @@ async fn delete_marks_terminating_while_cleaning_up() {
     })
     .await
     .unwrap();
-    assert_eq!(*observed.lock().unwrap(), phase::TERMINATING);
+    assert_eq!(*observed.lock().unwrap(), "Terminating");
     assert_eq!(
         svc.get_task(get("task-term")).await.unwrap_err().code(),
         Code::NotFound
@@ -614,7 +640,7 @@ async fn delete_keeps_task_when_cleanup_fails() {
         .unwrap_err();
     assert_eq!(err.code(), Code::Internal);
     let t = svc.get_task(get("task-err")).await.unwrap();
-    assert_eq!(phase_of(&t), phase::TERMINATING);
+    assert_eq!(state_of(&t), "Terminating");
 }
 
 /// A store whose status updates fail on demand.
@@ -624,6 +650,8 @@ struct FailingStore {
     fail_updates: AtomicBool,
     /// What every workspace lookup fails with, if anything.
     get_workspace_err: Mutex<Option<StoreError>>,
+    /// What every gateway lookup fails with, if anything.
+    get_gateway_err: Mutex<Option<StoreError>>,
 }
 
 #[async_trait]
@@ -643,6 +671,17 @@ impl TaskStore for FailingStore {
         }
         self.inner.update_task_status(a, n, s).await
     }
+    async fn set_task_delete_time(
+        &self,
+        a: &str,
+        n: &str,
+        t: Option<pbjson_types::Timestamp>,
+    ) -> rax_store::Result<()> {
+        if self.fail_updates.load(Ordering::SeqCst) {
+            return Err(StoreError::Backend("simulated store failure".into()));
+        }
+        self.inner.set_task_delete_time(a, n, t).await
+    }
     async fn delete_task(&self, a: &str, n: &str) -> rax_store::Result<()> {
         self.inner.delete_task(a, n).await
     }
@@ -659,8 +698,8 @@ impl ResourceStore for FailingStore {
         }
         self.inner.get_workspace(a, n).await
     }
-    async fn list_workspaces(&self, a: &str) -> rax_store::Result<Vec<Workspace>> {
-        self.inner.list_workspaces(a).await
+    async fn list_workspaces(&self, a: &str, l: i64, o: i64) -> rax_store::Result<Vec<Workspace>> {
+        self.inner.list_workspaces(a, l, o).await
     }
     async fn delete_workspace(&self, a: &str, n: &str) -> rax_store::Result<()> {
         self.inner.delete_workspace(a, n).await
@@ -669,6 +708,9 @@ impl ResourceStore for FailingStore {
         self.inner.save_gateway(g).await
     }
     async fn get_gateway(&self, a: &str, n: &str) -> rax_store::Result<Gateway> {
+        if let Some(e) = self.get_gateway_err.lock().unwrap().take() {
+            return Err(e);
+        }
         self.inner.get_gateway(a, n).await
     }
     async fn list_gateways(&self, a: &str) -> rax_store::Result<Vec<Gateway>> {
@@ -779,7 +821,10 @@ async fn create_task_requires_bound_workspace() {
                 ..Default::default()
             }),
             spec: Some(TaskSpec {
-                image: "alpine".into(),
+                profile: Some(Profile {
+                    image: "alpine".into(),
+                    ..Default::default()
+                }),
                 workspace: (!tc.binding.is_empty()).then(|| WorkspaceRef {
                     name: tc.binding.into(),
                     path: String::new(),
@@ -868,13 +913,15 @@ async fn save_running(store: &MemoryStore, name: &str) {
             ..Default::default()
         }),
         spec: Some(TaskSpec {
-            image: "alpine".into(),
+            profile: Some(Profile {
+                image: "alpine".into(),
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         status: Some(TaskStatus {
-            phase: "Running".into(),
+            state: TaskState::Working as i32,
             actor: name.into(),
-            worker_ip: "10.244.1.42".into(),
             conditions: vec![Condition {
                 r#type: "Ready".into(),
                 status: "True".into(),
@@ -912,8 +959,7 @@ async fn failed_suspend_keeps_running_state() {
     assert_eq!(err.code(), Code::Internal);
     let t = svc.get_task(get("task-suspend-err")).await.unwrap();
     let st = t.status.unwrap();
-    assert_eq!(st.phase, "Running");
-    assert_eq!(st.worker_ip, "10.244.1.42");
+    assert_eq!(st.state(), TaskState::Working);
     assert_eq!(st.conditions.len(), 1);
     assert_eq!(st.conditions[0].reason, reason::TASK_RUNNING);
 }
@@ -930,7 +976,7 @@ async fn successful_suspend_stores_no_actor_state() {
         })
         .await
         .unwrap();
-    assert_eq!(phase_of(&t), "Suspended");
+    assert_eq!(state_of(&t), "Suspended");
     assert_no_actor_state(&store.get_task("default", "task-suspend-ok").await.unwrap());
 }
 
@@ -961,8 +1007,8 @@ async fn reads_actor_state_from_substrate() {
         .status
         .unwrap();
     assert_eq!(
-        (st.phase.as_str(), st.worker_ip.as_str(), st.actor.as_str()),
-        ("Running", "10.244.1.7", "observed-a")
+        (st.state(), st.actor.as_str(), st.actor_uid.as_str()),
+        (TaskState::Working, "observed-a", "uid-observed-a")
     );
 
     let list = svc
@@ -974,14 +1020,14 @@ async fn reads_actor_state_from_substrate() {
         .unwrap();
     for t in &list.tasks {
         let st = t.status.as_ref().unwrap();
-        assert_eq!(st.phase, "Running");
+        assert_eq!(st.state(), TaskState::Working);
         assert_eq!(st.actor, t.metadata.as_ref().unwrap().name);
     }
 
     // A change on Substrate alone is visible on the next read.
     *actors.state.lock().unwrap() = ActorState::Suspended;
     assert_eq!(
-        phase_of(&svc.get_task(get("observed-a")).await.unwrap()),
+        state_of(&svc.get_task(get("observed-a")).await.unwrap()),
         "Suspended"
     );
     assert_no_actor_state(&store.get_task("default", "observed-a").await.unwrap());
@@ -995,7 +1041,7 @@ async fn new_tasks_start_suspended() {
         .create_task(new_task("task-create-suspended", "alpine"))
         .await
         .unwrap();
-    assert_eq!(phase_of(&t), "Suspended");
+    assert_eq!(state_of(&t), "Suspended");
     assert_no_actor_state(
         &store
             .get_task("default", "task-create-suspended")
@@ -1015,8 +1061,8 @@ async fn failed_provisioning_marks_failed() {
         .unwrap_err();
     assert_eq!(err.code(), Code::Internal);
     assert_eq!(
-        phase_of(&svc.get_task(get("task-create-fail")).await.unwrap()),
-        phase::FAILED
+        state_of(&svc.get_task(get("task-create-fail")).await.unwrap()),
+        "Failed"
     );
     // The task exists now, so creating it again is refused.
     let err = svc
@@ -1046,7 +1092,7 @@ async fn recovers_from_transient_substrate_outage() {
         .unwrap_err();
     assert_eq!(err.code(), Code::Unavailable);
     let stored = svc.get_task(get("simple-task")).await.unwrap();
-    assert_eq!(phase_of(&stored), phase::PENDING);
+    assert_eq!(state_of(&stored), "Queued");
 
     // Re-applying a Pending task with a different spec is refused.
     let err = svc
@@ -1069,7 +1115,7 @@ async fn recovers_from_transient_substrate_outage() {
     // Client-supplied status is ignored on a Pending retry.
     let mut forged = new_task("simple-task", "alpine");
     forged.task.as_mut().unwrap().status = Some(TaskStatus {
-        phase: "Running".into(),
+        state: TaskState::Working as i32,
         conditions: vec![Condition {
             r#type: "Ready".into(),
             status: "True".into(),
@@ -1094,7 +1140,7 @@ async fn recovers_from_transient_substrate_outage() {
         .create_task(new_task("simple-task", "alpine"))
         .await
         .unwrap();
-    assert_eq!(phase_of(&created), "Suspended");
+    assert_eq!(state_of(&created), "Suspended");
     assert_eq!(
         created.metadata.unwrap().create_time,
         stored.metadata.unwrap().create_time
@@ -1113,8 +1159,8 @@ async fn recovers_from_transient_substrate_outage() {
         .unwrap_err();
     assert_eq!(err.code(), Code::Unavailable);
     assert_eq!(
-        phase_of(&svc.get_task(get("simple-task")).await.unwrap()),
-        phase::PENDING
+        state_of(&svc.get_task(get("simple-task")).await.unwrap()),
+        "Queued"
     );
 }
 
@@ -1146,21 +1192,389 @@ async fn update_keeps_creation_time() {
     assert_eq!(first, second);
 }
 
-/// Tasks are immutable, and gateway rules are not applied yet, so a task that
-/// binds a gateway is refused rather than saved with a binding nothing honors.
+fn gateway(name: &str, atespace: &str, host: &str) -> Gateway {
+    Gateway {
+        metadata: Some(ObjectMeta {
+            name: name.into(),
+            atespace: atespace.into(),
+            ..Default::default()
+        }),
+        spec: Some(GatewaySpec {
+            egress: vec![rax_api::substrate::ateapi::v1::EgressRule {
+                https: Some(rax_api::substrate::ateapi::v1::HttpsRule {
+                    hostnames: vec![host.into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        }),
+        ..Default::default()
+    }
+}
+
+/// A task that binds a gateway needs it to exist: CreateTask neither saves
+/// nor provisions a task whose Gateway is missing. The reconciler gets the
+/// gateway the server resolved.
 #[tokio::test]
-async fn create_task_rejects_gateway_binding() {
+async fn create_task_requires_bound_gateway() {
+    for (name, task_atespace, gw_atespace, get_err, want_code, want_msg) in [
+        (
+            "missing",
+            "",
+            "",
+            None,
+            Code::FailedPrecondition,
+            r#"gateway "gw" not found in atespace "default""#,
+        ),
+        (
+            "store error",
+            "",
+            "",
+            Some(StoreError::Backend("store unavailable".into())),
+            Code::Internal,
+            r#"getting gateway "gw": store unavailable"#,
+        ),
+        ("present", "team-a", "team-a", None, Code::Ok, ""),
+    ] {
+        let store = Arc::new(FailingStore::default());
+        *store.get_gateway_err.lock().unwrap() = get_err;
+        if !gw_atespace.is_empty() {
+            store
+                .inner
+                .save_gateway(&mut gateway("gw", gw_atespace, "api.example.com"))
+                .await
+                .unwrap();
+        }
+        let rec = Arc::new(FakeReconciler::default());
+        let svc = AxService::new(store.clone(), on(rec.clone()));
+        let mut req = new_task("task", "alpine");
+        let task = req.task.as_mut().unwrap();
+        task.metadata.as_mut().unwrap().atespace = task_atespace.into();
+        task.spec.as_mut().unwrap().gateway = Some(GatewayRef { name: "gw".into() });
+        let result = svc.create_task(req).await;
+        let (code, msg) = match &result {
+            Ok(_) => (Code::Ok, String::new()),
+            Err(e) => (e.code(), e.message().to_owned()),
+        };
+        assert_eq!(code, want_code, "{name}: {msg}");
+        assert!(msg.contains(want_msg), "{name}: {msg:?}");
+        let atespace = if task_atespace.is_empty() {
+            "default"
+        } else {
+            task_atespace
+        };
+        let stored = store.inner.get_task(atespace, "task").await;
+        if want_code != Code::Ok {
+            assert!(matches!(stored, Err(StoreError::NotFound)), "{name}");
+            assert_eq!(rec.counts(), (0, 0), "{name}");
+            continue;
+        }
+        stored.unwrap();
+        let gw = rec.state.lock().unwrap().gateway.clone();
+        assert_eq!(
+            gw.and_then(|g| g.metadata).map(|m| m.name).as_deref(),
+            Some("gw"),
+            "{name}"
+        );
+    }
+}
+
+/// Fields the API has but AX does not implement yet are refused, rather
+/// than saved and ignored, unless validation rejects them first.
+#[tokio::test]
+async fn create_task_rejects_unimplemented_fields() {
     let store = Arc::new(MemoryStore::new());
-    let svc = service(store.clone(), Default::default());
-    let mut req = new_task("bound", "img");
-    req.task.as_mut().unwrap().spec.as_mut().unwrap().gateway =
-        Some(GatewayRef { name: "gw".into() });
-    let err = svc.create_task(req).await.unwrap_err();
-    assert_eq!(err.code(), Code::Unimplemented, "{err}");
-    assert!(matches!(
-        store.get_task("default", "bound").await,
-        Err(StoreError::NotFound)
-    ));
+    let svc = service(store.clone(), on(Arc::new(FakeReconciler::default())));
+    let create = |name: &str, spec: TaskSpec| CreateTaskRequest {
+        task: Some(Task {
+            metadata: meta(name),
+            spec: Some(spec),
+            ..Default::default()
+        }),
+    };
+    for (spec, want) in [
+        (
+            TaskSpec {
+                profile: Some(Profile {
+                    ate_actor_template: "user-tpl".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            "spec.profile.ateActorTemplate is not supported yet",
+        ),
+        (
+            TaskSpec {
+                retry: Some(RetryConfig {
+                    max_retries: 2,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            "spec.retry is not supported yet",
+        ),
+    ] {
+        let err = svc
+            .create_task(create("unimpl-task", spec))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::Unimplemented, "{err:?}");
+        assert!(err.message().contains(want), "{err:?}");
+        assert!(matches!(
+            store.get_task("default", "unimpl-task").await,
+            Err(StoreError::NotFound)
+        ));
+    }
+    let err = svc
+        .create_task(create(
+            "bad-retry",
+            TaskSpec {
+                retry: Some(RetryConfig {
+                    max_retries: -1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+
+    // A task without a profile inherits its workspace's ateActorTemplate and
+    // is refused; one with its own profile is not.
+    store
+        .save_workspace(&mut Workspace {
+            metadata: meta("ws-tpl"),
+            spec: Some(WorkspaceSpec {
+                profile: Some(Profile {
+                    ate_actor_template: "ws-user-tpl".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let bound = |profile: Option<Profile>| TaskSpec {
+        workspace: Some(WorkspaceRef {
+            name: "ws-tpl".into(),
+            ..Default::default()
+        }),
+        profile,
+        ..Default::default()
+    };
+    let err = svc
+        .create_task(create("inherits-ws-tpl", bound(None)))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Unimplemented, "{err:?}");
+    svc.create_task(create(
+        "overrides-ws-profile",
+        bound(Some(Profile {
+            resources: Some(ResourcesSpec {
+                limits: Some(ResourceList {
+                    memory: "1Gi".into(),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        })),
+    ))
+    .await
+    .unwrap();
+}
+
+/// A task whose actor is still resuming or reverting reads as Queued, and
+/// creating it again is refused without touching the actor.
+#[tokio::test]
+async fn create_task_rejects_a_resuming_task() {
+    for state in [ActorState::Resuming, ActorState::Reverting] {
+        let rec = Arc::new(FakeReconciler::default());
+        let svc = service(Arc::new(MemoryStore::new()), on(rec.clone()));
+        svc.create_task(new_task("resuming-task", "alpine"))
+            .await
+            .unwrap();
+        rec.set(|s| {
+            s.actors.insert("resuming-task".into(), state);
+        });
+        let got = svc.get_task(get("resuming-task")).await.unwrap();
+        assert_eq!(got.status.as_ref().unwrap().state(), TaskState::Queued);
+        let ready = got
+            .status
+            .as_ref()
+            .unwrap()
+            .conditions
+            .iter()
+            .find(|c| c.r#type == "Ready")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(ready.reason, reason::RESUMING, "{state:?}");
+        let err = svc
+            .create_task(new_task("resuming-task", "alpine"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition, "{state:?}");
+        assert_eq!(rec.counts(), (1, 0), "{state:?}");
+        assert_eq!(rec.state.lock().unwrap().actors["resuming-task"], state);
+    }
+}
+
+/// The actor's UID is read live and never stored, even when a client sends
+/// one.
+#[tokio::test]
+async fn actor_uids_are_live_and_not_stored() {
+    let store = Arc::new(MemoryStore::new());
+    let svc = service(store.clone(), on(Arc::new(FakeReconciler::default())));
+    let mut req = new_task("identity", "alpine");
+    req.task.as_mut().unwrap().status = Some(TaskStatus {
+        actor_uid: "client-uid".into(),
+        ..Default::default()
+    });
+    svc.create_task(req).await.unwrap();
+    let stored_uid = || async {
+        let t = store.get_task("default", "identity").await.unwrap();
+        t.status.unwrap_or_default().actor_uid
+    };
+    assert_eq!(stored_uid().await, "");
+    let got = svc.get_task(get("identity")).await.unwrap();
+    assert_eq!(got.status.unwrap().actor_uid, "uid-identity");
+    let list = svc
+        .list_tasks(ListTasksRequest {
+            atespace: "default".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        list.tasks[0].status.as_ref().unwrap().actor_uid,
+        "uid-identity"
+    );
+    svc.resume_task(ResumeTaskRequest {
+        name: "identity".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(stored_uid().await, "");
+    svc.suspend_task(SuspendTaskRequest {
+        name: "identity".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(stored_uid().await, "");
+}
+
+/// Workspaces are immutable: creating one again with the same spec returns
+/// it unchanged, and with another spec is refused.
+#[tokio::test]
+async fn workspaces_are_immutable() {
+    let svc = service(Arc::new(MemoryStore::new()), Default::default());
+    let create = |cmd: &str| CreateWorkspaceRequest {
+        workspace: Some(Workspace {
+            metadata: meta("imm-ws"),
+            spec: Some(WorkspaceSpec {
+                setup: Some(WorkspaceSetup {
+                    commands: vec![cmd.into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    };
+    let created = svc.create_workspace(create("echo setup")).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let again = svc.create_workspace(create("echo setup")).await.unwrap();
+    assert_eq!(
+        again.metadata.unwrap().create_time,
+        created.metadata.unwrap().create_time
+    );
+    let err = svc
+        .create_workspace(create("echo mutated"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
+    assert!(err.message().contains("already exists and is immutable"));
+
+    for (spec, want) in [
+        (
+            WorkspaceSpec {
+                profile: Some(Profile {
+                    resources: Some(ResourcesSpec {
+                        limits: Some(ResourceList {
+                            cpu: "1".into(),
+                            memory: "512Mi".into(),
+                        }),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            "spec.profile is not supported yet",
+        ),
+        (
+            WorkspaceSpec {
+                setup: Some(WorkspaceSetup {
+                    gateway: Some(GatewayRef {
+                        name: "build-gw".into(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            "spec.setup.gateway is not supported yet",
+        ),
+    ] {
+        let err = svc
+            .create_workspace(CreateWorkspaceRequest {
+                workspace: Some(Workspace {
+                    metadata: meta("unimpl-ws"),
+                    spec: Some(spec),
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::Unimplemented, "{err:?}");
+        assert!(err.message().contains(want), "{err:?}");
+    }
+}
+
+#[tokio::test]
+async fn lists_workspaces_by_page() {
+    let svc = service(Arc::new(MemoryStore::new()), Default::default());
+    for name in ["ws-a", "ws-b", "ws-c"] {
+        svc.create_workspace(CreateWorkspaceRequest {
+            workspace: Some(Workspace {
+                metadata: meta(name),
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap();
+    }
+    for (limit, offset, want) in [
+        // Most recently saved first, as both stores list.
+        (2, 0, vec!["ws-c", "ws-b"]),
+        (1, 1, vec!["ws-b"]),
+        (10, 99, vec![]),
+    ] {
+        let got: Vec<_> = svc
+            .list_workspaces(ListWorkspacesRequest {
+                atespace: "default".into(),
+                limit,
+                offset,
+            })
+            .await
+            .unwrap()
+            .workspaces
+            .into_iter()
+            .map(|w| w.metadata.unwrap().name)
+            .collect();
+        assert_eq!(got, want, "limit {limit}, offset {offset}");
+    }
 }
 
 #[tokio::test]
@@ -1288,7 +1702,7 @@ async fn success_clears_a_stored_failure() {
             assert_eq!(err.code(), Code::Internal);
             rec.set(|s| s.err = None);
             let t = svc.get_task(get(name)).await.unwrap();
-            assert_eq!(phase_of(&t), phase::FAILED, "{name} after a failed create");
+            assert_eq!(state_of(&t), "Failed", "{name} after a failed create");
         }
     };
 
@@ -1300,7 +1714,7 @@ async fn success_clears_a_stored_failure() {
         })
         .await
         .unwrap();
-    assert_eq!(phase_of(&t), "Suspended");
+    assert_eq!(state_of(&t), "Suspended");
 
     create_failed("task-resume").await;
     let t = svc
@@ -1310,10 +1724,10 @@ async fn success_clears_a_stored_failure() {
         })
         .await
         .unwrap();
-    assert_eq!(phase_of(&t), "Running");
+    assert_eq!(state_of(&t), "Working");
     assert_eq!(
-        phase_of(&svc.get_task(get("task-resume")).await.unwrap()),
-        "Running"
+        state_of(&svc.get_task(get("task-resume")).await.unwrap()),
+        "Working"
     );
 }
 
@@ -1333,8 +1747,8 @@ async fn suspending_cancels_a_failed_delete() {
     .await
     .unwrap_err();
     assert_eq!(
-        phase_of(&svc.get_task(get("task-undelete")).await.unwrap()),
-        phase::TERMINATING
+        state_of(&svc.get_task(get("task-undelete")).await.unwrap()),
+        "Terminating"
     );
     let t = svc
         .suspend_task(SuspendTaskRequest {
@@ -1343,5 +1757,5 @@ async fn suspending_cancels_a_failed_delete() {
         })
         .await
         .unwrap();
-    assert_eq!(phase_of(&t), "Suspended");
+    assert_eq!(state_of(&t), "Suspended");
 }
