@@ -604,7 +604,7 @@ mod tests {
         };
         s.exec(
             r#"INSERT INTO tasks (atespace, name, data, saved_at) VALUES
-               ('default', 'newer', '{"metadata":{"name":"newer","atespace":"default"},"spec":{"image":"x","fromTheFuture":1}}', now()),
+               ('default', 'newer', '{"metadata":{"name":"newer","atespace":"default"},"spec":{"profile":{"image":"x"},"fromTheFuture":1}}', now()),
                ('default', 'broken', '{"metadata":"not an object"}', now())"#,
         )
         .await;
