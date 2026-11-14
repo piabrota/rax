@@ -21,6 +21,7 @@ modules:
   - path: proto # imports are relative to AX's repository root, which proto/ mirrors
     includes:
       - proto/pkg/apis
+      - proto/google/rpc # googleapis' status.proto, which task.proto imports; AX takes it from buf.build/googleapis/googleapis
   - path: proto/substrate # Substrate's api/ateapi/v1, which gateway.proto imports; AX links it to .tmp/buf/substrate
     includes:
       - proto/substrate/api/ateapi/v1
