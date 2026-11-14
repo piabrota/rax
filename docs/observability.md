@@ -75,14 +75,58 @@ event name in `event`, so it is never dropped because OTLP is off. OTLP
 event records are batched, so a slow collector never delays the operation
 that emits them.
 
-As in AX, nothing records spans or emits events yet: this is the setup that
-request tracing and task state events build on.
+As in AX, nothing emits events yet: this is the setup that task state
+events build on.
 
 ## Metrics
 
 Each instrument keeps at most 2000 attribute sets per collection (the SDK
 default); further sets are folded into one overflow series. `/metrics` also
 serves the process metrics (`process_*`); they are not pushed over OTLP.
+
+As ax-server does, rax-server records `rpc.server.call.duration` for the AX
+RPCs it serves and `rpc.client.call.duration` for its calls to Substrate.
+Both histograms are in seconds and have three labels: `rpc.system.name`,
+`rpc.method` and `rpc.response.status_code`. The client histogram has no
+`server.address` or `server.port` label, whose values would be peer IP
+addresses.
+
+The buckets are 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 15, 20, 30 and 60
+seconds. A resume can wait for a snapshot restore and for the 15-second
+workspace readiness timeout, so the buckets go to 60 seconds, with
+boundaries on each side of 15 seconds. AX's
+`OTEL_SEMCONV_STABILITY_OPT_IN=rpc/dup`, which makes otelgrpc also record
+the old millisecond histograms, has no counterpart in rax-server.
+
+## Traces
+
+rax-server records a server span for each AX RPC it serves, and a client
+span for each call it makes to Substrate. Reconciles run inside the RPC, so
+`CreateActor` and `ResumeActor` show under the `CreateTask` or `ResumeTask`
+span. Spans are named `package.Service/Method`, as otelgrpc names them.
+
+- **Trace context:** the server span is a child of the caller's
+  `traceparent`. rax-server sends `traceparent` to Substrate, which also
+  samples ParentBased. It does not read or send `baggage`.
+- **Sampling by the caller:** a caller that sends a sampled `traceparent`
+  makes rax-server and Substrate record the call, so the 10% ratio does not
+  apply to it. `rax --trace` relies on this. rax-server has no
+  authentication yet, so it trusts this flag from all callers.
+- **Unknown methods:** a call to a method rax-server does not serve gets an
+  error, but no span or metric point, so a client cannot make new span
+  names or `rpc.method` values.
+- **Errors:** a Substrate call that does not return `OK` has the span
+  status `Error`, even when the code is an expected result, such as the
+  `NotFound` a delete polls `GetActor` for. A served call is an error only
+  for the codes that point at the server, as the semantic conventions have
+  it.
+
+AX's `deploy/ax-server.yaml` sets `OTEL_TRACES_EXPORTER: none`, so the
+server exports no spans by default but still sends its span IDs to
+Substrate. If Substrate exports its spans, your backend then shows
+Substrate spans whose parents are missing. To see the whole trace, set an
+OTLP endpoint and remove that line, as [Connect a collector](#connect-a-collector)
+shows.
 
 ## CLI traces
 
@@ -107,8 +151,10 @@ The CLI exports once, when the command ends, and waits at most 2 seconds
 the export fails, the CLI prints a warning that names the endpoint and gives
 the error.
 
-Like ax-server, rax-server does not read `traceparent` yet, so for now the
-trace has only the CLI spans.
+rax-server reads `traceparent`, so each AX RPC of a `--trace` command is a
+server span under the CLI's client span. If rax-server exports its spans
+(see [Traces](#traces)), one trace goes from the CLI through rax-server to
+Substrate.
 
 ## Attribute names
 
